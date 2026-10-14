@@ -10,11 +10,12 @@
 
 <p align="center">
   <a href="https://github.com/shihabal3amri/tekken-tag-tournament-2-pc/releases/latest">
-    <img src="https://img.shields.io/github/v/release/shihabal3amri/tekken-tag-tournament-2-pc?style=for-the-badge&label=Download%20for%20Windows&logo=windows&logoColor=white&color=e85c1c" alt="Download for Windows">
+    <img src=".github/assets/download.png" alt="Download for Windows" width="420">
   </a>
 </p>
 
 <p align="center">
+  <img src="https://img.shields.io/github/v/release/shihabal3amri/tekken-tag-tournament-2-pc?style=flat-square&label=latest&color=e85c1c" alt="Latest version">
   <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=flat-square&logo=windows&logoColor=white" alt="Windows 10 | 11">
   <img src="https://img.shields.io/badge/DirectX-11-2b2b2b?style=flat-square" alt="DirectX 11">
   <img src="https://img.shields.io/badge/Online-Steam%20(beta)-1b2838?style=flat-square&logo=steam&logoColor=white" alt="Online over Steam (beta)">
@@ -88,13 +89,13 @@ in a few minutes.
 
 ## What you need
 
-| | |
-|---|---|
-| **System** | Windows 10 or 11, 64-bit |
-| **Graphics** | Any DirectX 11 graphics card |
-| **Storage** | About 13 GB free |
-| **Your game** | *Tekken Tag Tournament 2 (USA, Europe)* Xbox 360 disc image (`.iso`) + Title Update 3 |
-| **For online** | The free Steam app, running and signed in |
+<table>
+  <tr><td><b>System</b></td><td>Windows 10 or 11, 64-bit</td></tr>
+  <tr><td><b>Graphics</b></td><td>Any DirectX 11 graphics card</td></tr>
+  <tr><td><b>Storage</b></td><td>About 13 GB free</td></tr>
+  <tr><td><b>Your game</b></td><td><i>Tekken Tag Tournament 2 (USA, Europe)</i> Xbox 360 disc image (<code>.iso</code>) + Title Update 3</td></tr>
+  <tr><td><b>For online</b></td><td>The free Steam app, running and signed in</td></tr>
+</table>
 
 ---
 
@@ -205,6 +206,16 @@ are gone. Voice chat isn't supported. Ranked matches and Steam invites ("Invite 
 been tested yet.
 
 ---
+
+<h3 align="center">Ready to fight?</h3>
+
+<p align="center">
+  <a href="https://github.com/shihabal3amri/tekken-tag-tournament-2-pc/releases/latest">
+    <img src=".github/assets/download.png" alt="Download for Windows" width="420">
+  </a>
+</p>
+
+<br>
 
 <p align="center">
   <b>For developers:</b> <a href="BUILDING.md">Building from source</a> &nbsp;•&nbsp;

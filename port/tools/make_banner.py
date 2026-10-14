@@ -1,6 +1,6 @@
 # Draws the README's banner: original art only (gradient, speed streaks, the port's own "T2" icon
 # from src/setup/ttt2.ico and plain typography) - no game artwork.
-#     python port/tools/make_banner.py .github/assets/banner.png
+#     python port/tools/make_banner.py .github/assets/banner.png [.github/assets/download.png]
 import math
 import os
 import sys
@@ -84,3 +84,30 @@ d.text((x, 640), "Not an emulator  \u2022  60 fps up to 4K  \u2022  Online with 
 
 img.convert("RGB").save(OUT, optimize=True)
 print("wrote", OUT, os.path.getsize(OUT), "bytes")
+
+# Optional second output: the README's download button (no version in it, so it never goes stale).
+if len(sys.argv) > 2:
+    TITLE, SUB = "Download for Windows", "Free  •  Windows 10 & 11  •  Bring your own copy of the game"
+    probe = ImageDraw.Draw(Image.new("RGBA", (1, 1)))
+    textW = max(probe.textlength(TITLE, font=font(BLACK, 72)), probe.textlength(SUB, font=font(SEMI, 36)))
+    BW, BH, R = int(230 + textW + 70), 200, 36
+    btn = Image.new("RGBA", (BW, BH), (0, 0, 0, 0))
+    grad = Image.new("RGBA", (BW, BH))
+    gd = ImageDraw.Draw(grad)
+    for y in range(BH):
+        t = y / (BH - 1)
+        gd.line([(0, y), (BW, y)], fill=(int(246 - 22 * t), int(112 - 30 * t), int(36 - 12 * t), 255))
+    mask = Image.new("L", (BW, BH), 0)
+    ImageDraw.Draw(mask).rounded_rectangle([0, 0, BW - 1, BH - 1], radius=R, fill=255)
+    btn.paste(grad, (0, 0), mask)
+    bd = ImageDraw.Draw(btn)
+    bd.rounded_rectangle([3, 3, BW - 4, BH - 4], radius=R - 3, outline=(255, 200, 140, 120), width=3)
+    # Download arrow into a tray.
+    cx, cy = 130, 100
+    bd.rectangle([cx - 11, cy - 58, cx + 11, cy + 4], fill=(255, 255, 255, 255))
+    bd.polygon([(cx - 40, cy - 2), (cx + 40, cy - 2), (cx, cy + 40)], fill=(255, 255, 255, 255))
+    bd.rounded_rectangle([cx - 52, cy + 52, cx + 52, cy + 64], radius=6, fill=(255, 255, 255, 255))
+    bd.text((230, 34), TITLE, font=font(BLACK, 72), fill=(255, 255, 255, 255))
+    bd.text((232, 120), SUB, font=font(SEMI, 36), fill=(255, 236, 220, 255))
+    btn.save(sys.argv[2], optimize=True)
+    print("wrote", sys.argv[2], os.path.getsize(sys.argv[2]), "bytes")
