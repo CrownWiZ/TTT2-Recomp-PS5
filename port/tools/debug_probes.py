@@ -8,6 +8,8 @@ Idempotent: skips a function if its probe marker is already present.
 Each probe prints the first N entries to a function with selected register/memory
 values, to trace the serialization-subsystem object creation chain (see
 PROJECT_STATUS.md session 4: crash at sub_82A77FC8, object 0x80D20000).
+Probes print only when the game runs with TTT2_PROBES=1 (ungated they wrote ~56k lines
+into every log, the released game's included).
 """
 import re
 import sys
@@ -144,7 +146,11 @@ PROBES = [
 ]
 
 HELPER = ('#include <cstdio>\n'
-          '#define GR(a) __builtin_bswap32(*(uint32_t*)(base + (uint32_t)(a)))\n')
+          '#include <cstdlib>\n'
+          '#define GR(a) __builtin_bswap32(*(uint32_t*)(base + (uint32_t)(a)))\n'
+          '// [probe] lines print only with TTT2_PROBES=1 (ungated they put ~56k lines in every log).\n'
+          'static const bool g_ttt2Probes = [] { const char* e = std::getenv("TTT2_PROBES"); '
+          'return e && *e == \'1\'; }();\n')
 LIMIT = 3000
 
 # Durable generated-code patches (re-applied after every regen, like probes).
@@ -319,7 +325,7 @@ def main():
             pat = re.compile(
                 r'(PPC_FUNC_IMPL\(__imp__' + fn + r'\)\s*\{\n(?:\s*PPC_FUNC_PROLOGUE\(\);\n)?)')
             guard = f'if (({cond})) ' if cond else ''
-            probe = (f'\t{{ static int _n; {guard}if (_n++ < {LIMIT}) '
+            probe = (f'\t{{ static int _n; {guard}if (g_ttt2Probes && _n++ < {LIMIT}) '
                      f'fprintf(stderr, "[probe] {fn} {fmt}\\n", '
                      + ", ".join(args) + '); }\n')
             # lambda replacement: keeps backslashes in `probe` literal (subn would eat \n)

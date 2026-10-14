@@ -8,6 +8,7 @@
 #include "title_server.h"
 #include "profiles.h"
 #include "sys_ui.h"
+#include "keyboard_keys.h"
 #include "xlive.h"
 #include <algorithm>
 #include <atomic>
@@ -501,42 +502,41 @@ struct PadSnapshot
 PadSnapshot g_pads[4];
 std::atomic<bool> g_padThreadStarted{false};
 
-// Keyboard buttons augment player 0 even when a controller is connected. Physical
+// Keyboard controls augment player 0 even when a controller is connected. Physical
 // analog controls remain intact. Only accept keys while our game is foreground,
 // so typing in another application cannot operate the game.
-// Enter/Space = START, Backspace = BACK, arrows = D-pad, A/S/Z/X = A/B/X/Y,
-// Q/W = shoulders.
-static uint16_t KeyboardPadButtons()
+// Every control has the key chosen in Controller Setup -> KEYBOARD (keyboard_keys.h; by default
+// arrows = D-pad, A/S/Z/X = A/B/X/Y, Q/W = shoulders, E/R = triggers, D/F = stick clicks,
+// Enter = START, Backspace = BACK); Space is an extra START while no control has it.
+struct KeyboardPad { uint16_t buttons = 0; bool leftTrigger = false, rightTrigger = false; };
+static KeyboardPad ReadKeyboardPad()
 {
+    KeyboardPad pad;
     DWORD foregroundProcess = 0;
     HWND foreground = GetForegroundWindow();
-    if (!foreground) return 0;
+    if (!foreground) return pad;
     GetWindowThreadProcessId(foreground, &foregroundProcess);
-    if (foregroundProcess != GetCurrentProcessId()) return 0;
-    auto down = [](int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; };
-    uint16_t b = 0;
+    if (foregroundProcess != GetCurrentProcessId()) return pad;
+    auto down = [](int vk) { return vk && (GetAsyncKeyState(vk) & 0x8000) != 0; };
+    if (SysUiKeyCaptureActive()) return pad;              // the keys are being chosen
     if (SysUiTextEntryActive())
     {
         // Name entry takes typed characters (WM_CHAR); only the arrows still steer.
-        if (down(VK_UP))    b |= 0x0001;
-        if (down(VK_DOWN))  b |= 0x0002;
-        if (down(VK_LEFT))  b |= 0x0004;
-        if (down(VK_RIGHT)) b |= 0x0008;
-        return b;
+        if (down(VK_UP))    pad.buttons |= 0x0001;
+        if (down(VK_DOWN))  pad.buttons |= 0x0002;
+        if (down(VK_LEFT))  pad.buttons |= 0x0004;
+        if (down(VK_RIGHT)) pad.buttons |= 0x0008;
+        return pad;
     }
-    if (down(VK_RETURN) || down(VK_SPACE)) b |= 0x0010;   // START
-    if (down(VK_BACK))   b |= 0x0020;                     // BACK
-    if (down(VK_UP))     b |= 0x0001;                     // DPAD_UP
-    if (down(VK_DOWN))   b |= 0x0002;                     // DPAD_DOWN
-    if (down(VK_LEFT))   b |= 0x0004;                     // DPAD_LEFT
-    if (down(VK_RIGHT))  b |= 0x0008;                     // DPAD_RIGHT
-    if (down('A'))       b |= 0x1000;                     // A
-    if (down('S'))       b |= 0x2000;                     // B
-    if (down('Z'))       b |= 0x4000;                     // X
-    if (down('X'))       b |= 0x8000;                     // Y
-    if (down('Q'))       b |= 0x0100;                     // LEFT_SHOULDER
-    if (down('W'))       b |= 0x0200;                     // RIGHT_SHOULDER
-    return b;
+    for (int c = 0; c < keyboard_keys::Count; ++c)
+    {
+        if (!down(keyboard_keys::Key(c))) continue;
+        pad.buttons |= keyboard_keys::Mask(c);
+        pad.leftTrigger |= c == keyboard_keys::LT;
+        pad.rightTrigger |= c == keyboard_keys::RT;
+    }
+    if (down(VK_SPACE) && !keyboard_keys::Bound(VK_SPACE)) pad.buttons |= 0x0010;
+    return pad;
 }
 
 struct PadPollState
@@ -682,10 +682,11 @@ void PollPadsOnce(PadPollState& polling, bool autoStart, uint64_t elapsedMs, Pad
     // controller 0 even when a physical pad is present or the window is inactive.
     const bool startPulse = autoStart && elapsedMs > 45000 && (elapsedMs % 9000) < 300;
     // Scripted presses join the keyboard's (controller 0, foreground not required).
-    const uint16_t keyboardButtons = KeyboardPadButtons() | (script ? ScriptButtons(*script, elapsedMs) : 0);
+    const KeyboardPad keyboard = ReadKeyboardPad();
+    const uint16_t keyboardButtons = keyboard.buttons | (script ? ScriptButtons(*script, elapsedMs) : 0);
     const uint16_t player2Buttons = script ? ScriptButtons(*script, elapsedMs, 1) : 0;
     if (script && script->active) autoStart = true;        // keep pad 0 connected for the script
-    polling.keyboardEverPressed |= keyboardButtons != 0;
+    polling.keyboardEverPressed |= keyboardButtons != 0 || keyboard.leftTrigger || keyboard.rightTrigger;
     XINPUT_STATE sampled[4]{};
     XINPUT_CAPABILITIES hostCaps[4]{};
     for (DWORD i = 0; i < 4; ++i)
@@ -761,10 +762,13 @@ void PollPadsOnce(PadPollState& polling, bool autoStart, uint64_t elapsedMs, Pad
             if (startPulse)
                 buttons |= 0x0010;
             state.Gamepad.wButtons |= buttons;
-            caps.Gamepad.wButtons |= 0xF33F; // supported mapped controls, independent of current presses
+            if (keyboard.leftTrigger) state.Gamepad.bLeftTrigger = 255;
+            if (keyboard.rightTrigger) state.Gamepad.bRightTrigger = 255;
+            caps.Gamepad.wButtons |= 0xF3FF; // supported mapped controls, independent of current presses
+            caps.Gamepad.bLeftTrigger = caps.Gamepad.bRightTrigger = 255;
             if (!physical)
             {
-                polling.keyboardEverPressed |= buttons != 0;
+                polling.keyboardEverPressed |= buttons != 0 || keyboard.leftTrigger || keyboard.rightTrigger;
                 connected = polling.keyboardEverPressed || autoStart;
                 caps.Type = XINPUT_DEVTYPE_GAMEPAD;
                 caps.SubType = XINPUT_DEVSUBTYPE_GAMEPAD;
@@ -831,6 +835,20 @@ uint16_t HostControllerButtons()
     return b;
 }
 
+// True while a connected pad (keyboard included) holds a trigger past the XInput threshold.
+bool HostTriggerHeld()
+{
+    EnsurePadThread();
+    for (auto& pad : g_pads)
+    {
+        if (!pad.connected.load()) continue;
+        std::lock_guard lk(pad.m);
+        const XINPUT_GAMEPAD& g = pad.state.Gamepad;
+        if (g.bLeftTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD || g.bRightTrigger > XINPUT_GAMEPAD_TRIGGER_THRESHOLD) return true;
+    }
+    return false;
+}
+
 // Player 1 presses START for 150 ms (the title continues after a profile signs in).
 void HostPulseStart() { g_startPulseUntilMs = NowMs() + 150; }
 
@@ -885,6 +903,13 @@ PPC_FUNC(__imp__XamInputGetState)
         st.Gamepad = XINPUT_GAMEPAD{};          // a system screen has the controller
     else if (SysUiTitleWantsProfile())
         st.Gamepad.wButtons &= ~uint16_t(0x0010 | 0x1000);   // START / A open Select Profile instead
+    else if (const uint16_t mask = SysUiGameButtonMask(); user == 0 && mask != 0xFFFF)
+    {
+        // Controller Setup's KEYBOARD mode takes the other buttons (and the stick's LEFT / RIGHT).
+        st.Gamepad.wButtons &= mask;
+        st.Gamepad.bLeftTrigger = st.Gamepad.bRightTrigger = 0;
+        st.Gamepad.sThumbLX = 0;
+    }
     else if (user == 0 && NowMs() < g_startPulseUntilMs.load())
     {
         st.Gamepad.wButtons |= 0x0010;

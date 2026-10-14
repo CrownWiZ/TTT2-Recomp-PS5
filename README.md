@@ -151,13 +151,18 @@ app the port uses to connect players.
 
 **Controller:** works just like on Xbox 360. Whoever presses a button first is Player 1.
 
-**Keyboard:**
+**Keyboard** (Player 1):
 
 | Key | Does | Key | Does |
 |---|---|---|---|
 | Arrow keys | Move / D-pad | `A` `S` `Z` `X` | A / B / X / Y |
 | `Enter` or `Space` | START | `Q` `W` | LB / RB |
-| `Backspace` | BACK | `Alt` + `Enter` | Window ↔ full screen |
+| `Backspace` | BACK | `E` `R` | LT / RT |
+| `Alt` + `Enter` | Window ↔ full screen | `D` `F` | Left / right stick click |
+
+**Change the keys** in the game: `OPTIONS` → `CONTROLLER SETUP` → on `BUTTON SETTINGS` press
+left/right to switch it to `KEYBOARD`, then `A` to edit. Pick a button, press `A`, then press the
+new key. `LB` / `RB` show the movement, START and BACK keys, plus `DEFAULTS` to undo everything.
 
 Display mode and resolution are in the game's own menu: `OPTIONS` → `DISPLAY SETTINGS`.
 

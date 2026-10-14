@@ -145,6 +145,19 @@ static void WriteFrontBufferBmp(const uint32_t* px)
 // windowed and borderless (Options -> Display Settings -> DISPLAY MODE offers all three).
 static LRESULT CALLBACK GameWndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+    if ((msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN) && SysUiKeyCaptureActive())
+    {
+        // Controller Setup -> KEYBOARD waits for a key: every key goes there (Alt+Enter too), with
+        // left / right SHIFT, CTRL and ALT told apart (WM_KEYDOWN reports them generically).
+        if (lp & (1 << 30)) return 0;           // auto-repeat
+        int vk = static_cast<int>(wp);
+        const bool extended = (lp & (1 << 24)) != 0;
+        if (vk == VK_SHIFT) vk = static_cast<int>(MapVirtualKeyA((lp >> 16) & 0xFF, MAPVK_VSC_TO_VK_EX));
+        else if (vk == VK_CONTROL) vk = extended ? VK_RCONTROL : VK_LCONTROL;
+        else if (vk == VK_MENU) vk = extended ? VK_RMENU : VK_LMENU;
+        SysUiOnKey(vk);
+        return 0;
+    }
     switch (msg)
     {
     case WM_CLOSE:
@@ -161,7 +174,11 @@ static LRESULT CALLBACK GameWndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         break;
     case WM_SYSCHAR:
-        if (wp == VK_RETURN) return 0;          // no beep for Alt+Enter
+        return 0;                               // no beep for Alt+Enter or Alt+letter (Alt can be a game key)
+    case WM_SYSCOMMAND:
+        // A lone Alt or F10 would put the window into menu mode (it has no menu): the next key
+        // then plays the error sound. Alt+F4 (SC_CLOSE) still closes.
+        if ((wp & 0xFFF0) == SC_KEYMENU) return 0;
         break;
     case WM_CHAR:
         // Typed text for the system UI's profile name entry (sys_ui.h); ignored otherwise.

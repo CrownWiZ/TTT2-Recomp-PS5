@@ -16,6 +16,8 @@ struct PcLists
 
 // The edited document, or an empty string when `doc` is not the Options / main-menu document or
 // an edit's anchor is missing (`why` says which); the game then keeps its own document.
-std::string ApplyPcEdits(const uint8_t* doc, size_t size, const PcLists& lists, std::string* why);
+// `note` reports an optional edit that was left out (the rest still applies).
+std::string ApplyPcEdits(const uint8_t* doc, size_t size, const PcLists& lists, std::string* why,
+                         std::string* note = nullptr);
 
 } // namespace menu_doc

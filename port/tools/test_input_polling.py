@@ -1,9 +1,11 @@
 """Exercise production input polling with synthetic keyboard and XInput devices.
 
 No window, hardware pad, real keystroke or game data is needed. Host sampling is
-mocked; source selection, backoff, publication and packet numbers are production.
+mocked; source selection, backoff, publication and packet numbers are production, and
+so are the keyboard key settings (keyboard_keys.cpp, kept in a temporary settings.ini).
 """
 
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -31,6 +33,8 @@ XINPUT_CAPABILITIES capabilities[4]{};
 unsigned samples[4]{},capsSamples[4]{};
 bool focused=true,windowExists=true,textEntry=false;
 bool SysUiTextEntryActive() { return textEntry; }
+bool captureActive=false;
+bool SysUiKeyCaptureActive() { return captureActive; }
 HWND TestForegroundWindow() { return windowExists ? reinterpret_cast<HWND>(1) : nullptr; }
 DWORD TestWindowProcess(HWND,LPDWORD pid) { *pid=GetCurrentProcessId()+(focused?0:1);return 1; }
 SHORT ReadTestKey(int key) { return keys.at(key) ? SHORT(0x8000) : 0; }
@@ -42,6 +46,7 @@ DWORD SampleTestPad(DWORD index,XINPUT_STATE* out) {
 DWORD SampleTestCaps(DWORD index,DWORD,XINPUT_CAPABILITIES* out) {
     ++capsSamples[index];*out=capabilities[index];return ERROR_SUCCESS;
 }
+@KEYS@
 #define GetAsyncKeyState ReadTestKey
 #define GetForegroundWindow TestForegroundWindow
 #define GetWindowThreadProcessId TestWindowProcess
@@ -75,7 +80,7 @@ int main() {
 
     keys[VK_RETURN]=true;PollPadsOnce(poll,false,1000);
     CHECK(g_pads[0].connected && !g_pads[0].physical && g_pads[0].state.Gamepad.wButtons==0x10);
-    CHECK(g_pads[0].caps.Gamepad.wButtons==0xF33F);
+    CHECK(g_pads[0].caps.Gamepad.wButtons==0xF3FF);
     DWORD packet=g_pads[0].state.dwPacketNumber;
     for(unsigned tick=0;tick<400;++tick) {
         PollPadsOnce(poll,false,1010+tick*8);
@@ -84,7 +89,7 @@ int main() {
     CHECK(samples[0]>=2 && samples[0]<=3); // Physical retry continues without flapping keyboard.
     keys[VK_RETURN]=false;PollPadsOnce(poll,false,5000);
     CHECK(g_pads[0].connected && g_pads[0].state.Gamepad.wButtons==0);
-    CHECK(g_pads[0].caps.Gamepad.wButtons==0xF33F && g_pads[0].caps.Gamepad.bLeftTrigger==0);
+    CHECK(g_pads[0].caps.Gamepad.wButtons==0xF3FF && g_pads[0].caps.Gamepad.bLeftTrigger==255);
     CHECK(g_pads[0].state.dwPacketNumber==packet+1);
     packet=g_pads[0].state.dwPacketNumber;
     PollPadsOnce(poll,false,5008);CHECK(g_pads[0].state.dwPacketNumber==packet);
@@ -230,18 +235,51 @@ int main() {
     CHECK(g_pads[0].connected && g_pads[0].state.Gamepad.wButtons==0x0001);
     textEntry=false;PollPadsOnce(poll,false,8);
     CHECK(g_pads[0].state.Gamepad.wButtons==(0x0001|0x0010|0x1000|0x2000));
-    std::printf("PASS %u input checks: focused keyboard/controller combination, hotplug, packet edges, START timing, player 1 = first pad used, text entry\n",checks);
+    // Key settings: the default keys reach every control (E / R triggers, D / F stick clicks), a
+    // new key replaces the old one, a taken key swaps, Space is START only while unbound, and
+    // nothing is mapped while a key is being chosen.
+    textEntry=false;keyboard_keys::RestoreDefaults();
+    Reset();poll={};keys['E']=keys['D']=true;PollPadsOnce(poll,false,0);
+    CHECK(g_pads[0].state.Gamepad.bLeftTrigger==255 && g_pads[0].state.Gamepad.bRightTrigger==0);
+    CHECK(g_pads[0].state.Gamepad.wButtons==0x0040);
+    keys['E']=keys['D']=false;keys['R']=keys['F']=true;PollPadsOnce(poll,false,8);
+    CHECK(g_pads[0].state.Gamepad.bRightTrigger==255 && g_pads[0].state.Gamepad.bLeftTrigger==0);
+    CHECK(g_pads[0].state.Gamepad.wButtons==0x0080);
+    keys['R']=keys['F']=false;keys[VK_SPACE]=true;PollPadsOnce(poll,false,16);
+    CHECK(g_pads[0].state.Gamepad.wButtons==0x0010);
+    keyboard_keys::Assign(keyboard_keys::X,'J');
+    keys[VK_SPACE]=false;keys['J']=true;PollPadsOnce(poll,false,24);
+    CHECK(g_pads[0].state.Gamepad.wButtons==0x4000);
+    keys['J']=false;keys['Z']=true;PollPadsOnce(poll,false,32);
+    CHECK(g_pads[0].state.Gamepad.wButtons==0 && !keyboard_keys::Bound('Z'));
+    keyboard_keys::Assign(keyboard_keys::X,'S');   // B's key: B takes J
+    CHECK(keyboard_keys::Key(keyboard_keys::X)=='S' && keyboard_keys::Key(keyboard_keys::B)=='J');
+    keys['Z']=false;keys['S']=true;PollPadsOnce(poll,false,40);
+    CHECK(g_pads[0].state.Gamepad.wButtons==0x4000);
+    keyboard_keys::Assign(keyboard_keys::LB,VK_SPACE);
+    keys['S']=false;keys[VK_SPACE]=true;PollPadsOnce(poll,false,48);
+    CHECK(g_pads[0].state.Gamepad.wButtons==0x0100); // Space is LB now, not START
+    captureActive=true;PollPadsOnce(poll,false,56);
+    CHECK(g_pads[0].state.Gamepad.wButtons==0);
+    captureActive=false;CHECK(!keyboard_keys::Assignable(VK_ESCAPE));
+    keyboard_keys::RestoreDefaults();
+    CHECK(keyboard_keys::Key(keyboard_keys::X)=='Z' && keyboard_keys::Key(keyboard_keys::LB)=='Q');
+    std::printf("PASS %u input checks: focused keyboard/controller combination, hotplug, packet edges, START timing, player 1 = first pad used, text entry, key settings\n",checks);
 }
 '''
 
 
 def main():
-    text = (ROOT / "port/src/runtime/kernel/kernel_xam.cpp").read_text(encoding="utf-8-sig")
+    kernel = ROOT / "port/src/runtime/kernel"
+    text = (kernel / "kernel_xam.cpp").read_text(encoding="utf-8-sig")
     begin, end = text.index("struct PadSnapshot"), text.index("void EnsurePadThread")
+    keys = (kernel / "keyboard_keys.cpp").read_text(encoding="utf-8-sig")
     with tempfile.TemporaryDirectory(prefix="ttt2-input-") as temp:
         folder = Path(temp)
-        exe = compile_one(folder, "input", CHECKER.replace("@PRODUCTION@", text[begin:end]), [])
-        subprocess.run([str(exe)], check=True, timeout=10)
+        source = CHECKER.replace("@KEYS@", keys).replace("@PRODUCTION@", text[begin:end])
+        exe = compile_one(folder, "input", source, [kernel])
+        env = dict(os.environ, TTT2_SETTINGS_INI=str(folder / "settings.ini"))
+        subprocess.run([str(exe)], check=True, timeout=10, env=env)
 
 
 if __name__ == "__main__":

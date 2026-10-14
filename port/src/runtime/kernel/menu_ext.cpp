@@ -6,7 +6,9 @@
 //    and RESOLUTION rows in Display Settings, EXIT in the main menu with its confirmation;
 //  - registers the natives those rows and the dialog call, next to the game's own options natives;
 //  - initialises the new rows' value cursors whenever Display Settings initialises MOTION BLUR's;
-//  - supplies the confirmation's text and YES / NO labels, and quits on YES.
+//  - supplies the confirmation's text and YES / NO labels, and quits on YES;
+//  - Controller Setup's KEYBOARD mode: player 1's keyboard keys shown and changed in the button
+//    panel (keyui below, keyboard_keys.h).
 // It also hosts the system UI (sys_ui.h: Select Profile and the new profile's name dialog).
 // Diagnostics: TTT2_MENU_DUMP=1 writes every BX01 document (and the edited one) to
 // C:/ttt2/port/menu_bin/; TTT2_TEXT_TRACE=1 logs each text id the game looks up (first time, with
@@ -20,6 +22,7 @@
 #include "menu_doc.h"
 #include "sys_ui.h"
 #include "profiles.h"
+#include "keyboard_keys.h"
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -40,6 +43,7 @@ extern "C" PPC_FUNC(__imp__sub_8237F5D0);
 extern "C" PPC_FUNC(__imp__sub_8241E7A8);
 extern "C" PPC_FUNC(__imp__sub_82623858);
 extern "C" PPC_FUNC(__imp__sub_8241B9D0);
+extern "C" PPC_FUNC(__imp__sub_8256C708);
 extern void (*g_uiFrameHook)(PPCContext& ctx, uint8_t* base);
 void XamNotifyEnqueueEvent(uint32_t id, uint32_t param);
 
@@ -142,12 +146,15 @@ uint32_t GuestStr(uint8_t* base, const std::string& s)
     pool.emplace(s, addr);
     return addr;
 }
+bool g_hostText = false;                              // MenuSetText is writing (the hook passes it on)
 void MenuSetText(PPCContext& ctx, uint8_t* base, const std::string& widget, const std::string& text)
 {
     GuestFrame frame(ctx, base, 0x100);
     ctx.r3.u64 = GuestStr(base, text);
     ctx.r4.u64 = GuestStr(base, widget);
+    g_hostText = true;
     sub_8256C708(ctx, base);                          // lib::MenuEntitySetText(text, widget)
+    g_hostText = false;
 }
 void MenuMovieVisible(PPCContext& ctx, uint8_t* base, const std::string& movie, bool visible)
 {
@@ -700,12 +707,310 @@ void Frame(PPCContext& ctx, uint8_t* base)
 
 } // namespace sysui
 
+// ---- Options -> Controller Setup: KEYBOARD mode (KEYBOARD_PLAN.md) ------------------------------
+// The screen's artwork has room for three rows, so player 1's BUTTON SETTINGS row carries a mode in
+// its value text (menu_doc.cpp): PAD (the game's own button settings) or KEYBOARD, switched with
+// LEFT / RIGHT while no other button is held (the game's own change is a held button + LEFT /
+// RIGHT). In KEYBOARD mode the button panel's ten slots show each button's key instead of its
+// action - the game writes the slots with lib::MenuEntitySetText, so its texts are recorded there
+// (the hook below) and put back when the mode or the row is left - and the game sees only UP /
+// DOWN on that row. A starts editing in the panel itself: a highlighted slot moves with the
+// arrows, LB / RB turn to the second page (UP DOWN LEFT RIGHT START BACK and DEFAULTS), A asks
+// for the slot's key (PRESS A KEY; keys then arrive from the window, SysUiOnKey, while the game
+// gets neutral input), B or ESC ends editing. No windows open.
+namespace keyui {
+
+using namespace keyboard_keys;
+constexpr int kButtonSettingsRow = 1;                    // BUTTON SETTINGS in player 1's menu
+constexpr uint16_t kPadUp = 0x0001, kPadDown = 0x0002, kPadLeft = 0x0004, kPadRight = 0x0008, kPadStart = 0x0010,
+                   kPadLB = 0x0100, kPadRB = 0x0200, kPadA = 0x1000, kPadB = 0x2000, kDpad = 0x000F;
+constexpr int kDefaults = -2, kNone = -1;                 // page 2 cells without a control
+const std::string kMenu = "MenuMode007-03-01-1", kValue = "StaticTextMenuItemMode007-03-02-1",
+                  kHelp = "StaticTextMode007-03-02-1";
+// Panel slot StaticTextMode007-03-SS-1-1 (SS = 01..10): the left column top down, then the right
+// (MEASURED on screen 2026-10-14). Slot = column * 5 + row.
+const int kPage[2][10] = {
+    { LB, LT, X, A, LS, RB, RT, Y, B, RS },
+    { Up, Down, Left, Right, kNone, Start, Back, kNone, kNone, kDefaults },
+};
+
+struct State
+{
+    bool here = false;                                   // Controller Setup was up last frame
+    bool keyboard = false;                               // BUTTON SETTINGS shows KEYBOARD
+    bool editing = false, capturing = false, releasing = false;
+    int page = 0, slot = 0;
+    std::string value;                                   // the value text as last written
+    std::string gameText[10];                            // the game's slot texts (icon + action)
+    std::string shown[10];                               // the slots while keys are shown
+    bool showing = false;
+    std::string help;                                    // the help line while keys are shown
+    uint16_t prevButtons = 0;
+    bool prevEsc = false;
+} g_state;
+std::atomic<bool> g_capture{ false };
+std::atomic<uint16_t> g_gameMask{ 0xFFFF };              // the buttons the game may see (XamInputGetState)
+std::mutex g_keyMutex;
+std::vector<int> g_keys;                                 // keys pressed since the last frame
+
+int SlotOf(const std::string& widget)
+{
+    // "StaticTextMode007-03-SS-1-1"
+    static const std::string prefix = "StaticTextMode007-03-", suffix = "-1-1";
+    if (widget.size() != prefix.size() + 2 + suffix.size() || widget.compare(0, prefix.size(), prefix) != 0 ||
+        widget.compare(prefix.size() + 2, suffix.size(), suffix) != 0)
+        return -1;
+    const int s = (widget[prefix.size()] - '0') * 10 + (widget[prefix.size() + 1] - '0');
+    return s >= 1 && s <= 10 ? s - 1 : -1;
+}
+std::string SlotWidget(int slot) { return "StaticTextMode007-03-" + sysui::Two(slot + 1) + "-1-1"; }
+
+// A key's name as short as the panel's slots need.
+std::string ShortKeyName(int vk)
+{
+    switch (vk)
+    {
+    case VK_BACK: return "BKSP";
+    case VK_PRIOR: return "PG UP";
+    case VK_NEXT: return "PG DN";
+    default: return KeyName(vk);
+    }
+}
+
+// What a slot shows: on page 1 the game's icon part ("~white~<icon> ") and the key, on page 2 the
+// control's name and its key (just PRESS A KEY while it waits: the help line names the control).
+// The key is in the panel's colour (~default~), the slot being edited in yellow - the colours the
+// game's text system knows: red green yellow white gray blue lightgray default; a text has to
+// start with one (~white~, as the game's own) for the others to be read, and two tags must not
+// touch ("~~" breaks them: the whole text then shows literally).
+std::string SlotText(const State& st, int slot)
+{
+    const int control = kPage[st.page][slot];
+    if (control == kNone) return "";
+    const bool selected = st.editing && slot == st.slot;
+    const std::string colour = selected ? "~yellow~" : "~default~";
+    if (control == kDefaults) return "~white~ " + colour + "DEFAULTS";
+    const bool asking = st.capturing && selected;
+    const std::string key = asking ? std::string("PRESS A KEY") : ShortKeyName(Key(control));
+    if (st.page == 1)
+        return asking ? "~white~ " + colour + key : std::string("~white~") + ControlName(control) + " " + colour + key;
+    const std::string& game = st.gameText[slot];
+    const size_t at = game.find("~default~");
+    return (at == std::string::npos ? std::string("~white~") : game.substr(0, at)) + colour + key;
+}
+
+std::string HelpText(const State& st)
+{
+    const int control = kPage[st.page][st.slot];
+    if (st.capturing) return std::string("Press a key for ") + ControlName(control) + ".   ESC: cancel";
+    if (st.editing && control == kDefaults) return "A: restore the default keys   B: done";
+    if (st.editing) return "A: change   LB / RB: page   B: done";
+    return "A: edit keys";
+}
+
+std::string CurrentFrame(PPCContext& ctx, uint8_t* base)
+{
+    GuestFrame frame(ctx, base, 0x100);
+    sub_8256C100(ctx, base);                              // lib::MenuGetCurrentFrameName
+    return GuestString(base, ctx.r3.u32, 64);
+}
+int MenuCursor(PPCContext& ctx, uint8_t* base, const std::string& menu)
+{
+    GuestFrame frame(ctx, base, 0x100);
+    ctx.r3.u64 = GuestStr(base, menu);
+    sub_8256C968(ctx, base);                              // lib::MenuContainerGetCursor(menu)
+    return static_cast<int32_t>(ctx.r3.u32);
+}
+// The game's own help text of BUTTON SETTINGS (textid360 4,635), back after the keyboard hints.
+void RestoreHelp(PPCContext& ctx, uint8_t* base)
+{
+    GuestFrame frame(ctx, base, 0x100);
+    ctx.r3.u64 = 4;
+    ctx.r4.u64 = 635;
+    ctx.r5.u64 = GuestStr(base, kHelp);
+    sub_8256C7A8(ctx, base);                              // lib::MenuEntitySetTextID(table, id, widget)
+}
+
+bool Foreground()
+{
+    DWORD process = 0;
+    const HWND w = GetForegroundWindow();
+    if (w) GetWindowThreadProcessId(w, &process);
+    return w && process == GetCurrentProcessId();
+}
+bool AnyKeyDown()
+{
+    for (int vk = 8; vk < 256; ++vk)
+        if (GetAsyncKeyState(vk) & 0x8000) return true;
+    return false;
+}
+
+// The next slot from `slot` in a direction (page 2 skips its empty cells; rows and columns wrap).
+int Move(int page, int slot, uint16_t dir)
+{
+    int col = slot / 5, row = slot % 5;
+    for (int tries = 0; tries < 10; ++tries)
+    {
+        if (dir == kPadUp) row = (row + 4) % 5;
+        else if (dir == kPadDown) row = (row + 1) % 5;
+        else col ^= 1;
+        if (kPage[page][col * 5 + row] != kNone) return col * 5 + row;
+        if (dir & (kPadLeft | kPadRight)) dir = kPadUp;   // an empty cell across: go up to a used one
+    }
+    return slot;
+}
+
+void Edit(PPCContext& ctx, uint8_t* base, State& st, uint16_t pressed, bool esc)
+{
+    if (st.capturing)
+    {
+        std::vector<int> keys;
+        {
+            std::lock_guard l(g_keyMutex);
+            keys.swap(g_keys);
+        }
+        bool done = (pressed & kPadB) != 0;               // a controller's B cancels too
+        for (int vk : keys)
+        {
+            if (done) break;
+            if (vk == VK_ESCAPE) { done = true; break; }
+            if (!Assignable(vk)) continue;
+            Assign(kPage[st.page][st.slot], vk);
+            MenuSound(ctx, base, kSoundDecide);
+            done = true;
+        }
+        if (!done) return;
+        st.capturing = false;
+        st.releasing = true;                              // g_capture stays until the keys are up
+        return;
+    }
+    if (pressed & (kPadB) || esc)
+    {
+        st.editing = false;
+        MenuSound(ctx, base, kSoundCancel);
+        return;
+    }
+    if (pressed & (kPadLB | kPadRB))
+    {
+        st.page ^= 1;
+        st.slot = 0;
+        MenuSound(ctx, base, kSoundCursor);
+        return;
+    }
+    for (const uint16_t dir : { kPadUp, kPadDown, kPadLeft, kPadRight })
+        if (pressed & dir)
+        {
+            st.slot = Move(st.page, st.slot, dir);
+            MenuSound(ctx, base, kSoundCursor);
+            return;
+        }
+    if (pressed & (kPadA | kPadStart))
+    {
+        const int control = kPage[st.page][st.slot];
+        MenuSound(ctx, base, kSoundDecide);
+        if (control == kDefaults) { RestoreDefaults(); return; }
+        st.capturing = true;
+        {
+            std::lock_guard l(g_keyMutex);
+            g_keys.clear();
+        }
+        g_capture = true;
+    }
+}
+
+void Draw(PPCContext& ctx, uint8_t* base, State& st, bool keys)
+{
+    if (keys)
+    {
+        for (int s = 0; s < 10; ++s)
+        {
+            const std::string text = SlotText(st, s);
+            if (!st.showing || st.shown[s] != text) MenuSetText(ctx, base, SlotWidget(s), text);
+            st.shown[s] = text;
+        }
+        const std::string help = HelpText(st);
+        if (!st.showing || help != st.help) MenuSetText(ctx, base, kHelp, help);
+        st.help = help;
+        st.showing = true;
+    }
+    else if (st.showing)
+    {
+        for (int s = 0; s < 10; ++s)
+            if (!st.gameText[s].empty()) MenuSetText(ctx, base, SlotWidget(s), st.gameText[s]);
+        RestoreHelp(ctx, base);
+        st.showing = false;
+    }
+}
+
+void Frame(PPCContext& ctx, uint8_t* base)
+{
+    State& st = g_state;
+    if (CurrentFrame(ctx, base) != "FrameControlerSetup")
+    {
+        if (st.here) std::fprintf(stderr, "[keyboard] controller setup closed\n");
+        State fresh;                                      // the game's slot texts stay recorded
+        std::copy(std::begin(st.gameText), std::end(st.gameText), std::begin(fresh.gameText));
+        st = fresh;
+        g_capture = false;
+        g_gameMask = 0xFFFF;
+        return;
+    }
+    const uint16_t buttons = HostControllerButtons();
+    const bool esc = Foreground() && (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
+    if (!st.here)
+    {
+        st.here = true;                                   // every visit starts on PAD
+        st.prevButtons = buttons;                         // the A that opened the screen is not ours
+        st.prevEsc = esc;
+    }
+    const uint16_t pressed = buttons & ~st.prevButtons;
+    const bool escPressed = esc && !st.prevEsc;
+    st.prevButtons = buttons;
+    st.prevEsc = esc;
+
+    if (st.releasing)
+    {
+        // The new key is still down: it acts as its button only once released.
+        if (!AnyKeyDown() && !(buttons & 0xF3FF)) { st.releasing = false; g_capture = false; st.prevButtons = 0; }
+    }
+    else if (st.editing) Edit(ctx, base, st, pressed, escPressed);
+    else if (MenuCursor(ctx, base, kMenu) == kButtonSettingsRow)
+    {
+        // Not while a button or trigger is held: that is the game's own change of its action.
+        if ((pressed & (kPadLeft | kPadRight)) && !(buttons & ~kDpad) && !HostTriggerHeld())
+        {
+            st.keyboard = !st.keyboard;
+            MenuSound(ctx, base, kSoundCursor);
+        }
+        else if (st.keyboard && (pressed & kPadA))
+        {
+            st.editing = true;
+            st.page = 0;
+            st.slot = 0;
+            MenuSound(ctx, base, kSoundDecide);
+        }
+    }
+    const bool onRow = st.editing || MenuCursor(ctx, base, kMenu) == kButtonSettingsRow;
+    g_gameMask = st.editing ? uint16_t(0) : (onRow && st.keyboard) ? uint16_t(0x0003) : uint16_t(0xFFFF);
+
+    const std::string value = st.keyboard ? "KEYBOARD" : "PAD";
+    if (value != st.value)
+    {
+        MenuSetText(ctx, base, kValue, value);
+        st.value = value;
+    }
+    Draw(ctx, base, st, onRow && st.keyboard);
+}
+
+} // namespace keyui
+
 // Runs on the game's main thread once per frame (end of VdSwap, registers restored after): the
 // system UI, and a diagnostics trigger - C:/ttt2/port/ui.trigger holding a frame name switches
 // the menu to that frame.
 void UiFrame(PPCContext& ctx, uint8_t* base)
 {
     sysui::Frame(ctx, base);
+    keyui::Frame(ctx, base);
     static uint32_t tick = 0;
     if (++tick % 30) return;
     FILE* f = std::fopen("C:/ttt2/port/ui.trigger", "rb");
@@ -723,7 +1028,15 @@ struct UiHookInstall { UiHookInstall() { g_uiFrameHook = UiFrame; } } g_uiHookIn
 } // namespace
 
 bool SysUiRequestSignIn() { sysui::g_signInRequest = true; return true; }
-bool SysUiOwnsInput() { return sysui::g_owns.load() || sysui::g_boxOwns.load(); }
+bool SysUiOwnsInput() { return sysui::g_owns.load() || sysui::g_boxOwns.load() || keyui::g_capture.load(); }
+bool SysUiKeyCaptureActive() { return keyui::g_capture.load(); }
+uint16_t SysUiGameButtonMask() { return keyui::g_gameMask.load(); }
+void SysUiOnKey(int vk)
+{
+    if (!keyui::g_capture.load()) return;
+    std::lock_guard l(keyui::g_keyMutex);
+    if (keyui::g_keys.size() < 16) keyui::g_keys.push_back(vk);
+}
 bool SysUiTitleWantsProfile() { return !profiles::SignedIn() && sysui::TitleLogo(); }
 bool SysUiTextEntryActive() { return sysui::g_textEntry.load(); }
 bool SysUiShowMessageBox(SysUiMessageBox box)
@@ -915,6 +1228,22 @@ PPC_FUNC(sub_8241B9D0)
     __imp__sub_8241B9D0(ctx, base);
 }
 
+// lib::MenuEntitySetText(text, widget): Controller Setup's button panel (player 1) - the game's
+// texts are recorded, and while the KEYBOARD mode shows keys the game's writes keep the key.
+PPC_FUNC(sub_8256C708)
+{
+    if (!g_hostText && ctx.r4.u32 && ctx.r3.u32)
+    {
+        const int slot = keyui::SlotOf(GuestString(base, ctx.r4.u32, 40));
+        if (slot >= 0)
+        {
+            keyui::g_state.gameText[slot] = GuestString(base, ctx.r3.u32, 96);
+            if (keyui::g_state.showing) ctx.r3.u64 = GuestStr(base, keyui::SlotText(keyui::g_state, slot));
+        }
+    }
+    __imp__sub_8256C708(ctx, base);
+}
+
 // Text lookup (text manager, id): the exit confirmation's message and button labels, the name
 // dialog's message.
 PPC_FUNC(sub_8237F5D0)
@@ -1003,8 +1332,9 @@ PPC_FUNC(sub_82346060)
     }
     else
     {
-        std::string why;
-        const std::string edited = menu_doc::ApplyPcEdits(doc, size, PcLists(), &why);
+        std::string why, note;
+        const std::string edited = menu_doc::ApplyPcEdits(doc, size, PcLists(), &why, &note);
+        if (!note.empty()) std::fprintf(stderr, "[menu] %s\n", note.c_str());
         if (!edited.empty())
         {
             if (MenuDump())

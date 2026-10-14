@@ -42,8 +42,20 @@ bool SysUiTextEntryActive();
 // A character typed on the PC keyboard (window thread, WM_CHAR).
 void SysUiOnChar(uint32_t ch);
 
+// True while Controller Setup -> KEYBOARD waits for a key (keyboard_keys.h): keys are not mapped
+// to buttons, and the window passes each pressed key on.
+bool SysUiKeyCaptureActive();
+// A key pressed on the PC keyboard (window thread, WM_KEYDOWN / WM_SYSKEYDOWN; left / right
+// SHIFT, CTRL and ALT told apart).
+void SysUiOnKey(int vk);
+// The buttons player 1's game input keeps (0xFFFF = all): Controller Setup's KEYBOARD mode leaves
+// the game UP / DOWN on its row.
+uint16_t SysUiGameButtonMask();
+
 // Input layer (kernel_xam.cpp): every connected controller's buttons (keyboard included, left
 // stick as D-pad), read even while the game gets neutral input; and a 150 ms START press for
 // player 1 (the title continues once a profile is signed in).
 uint16_t HostControllerButtons();
+// The triggers are not buttons: true while any connected pad holds one.
+bool HostTriggerHeld();
 void HostPulseStart();

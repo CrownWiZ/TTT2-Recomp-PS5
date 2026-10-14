@@ -318,8 +318,9 @@ void XtalAppendIconRow(std::string& blob, uint8_t lastSmall, uint8_t large, cons
 
 void AddSystemFrames(Doc& d);
 void AddSwitchProfile(Doc& d);
+void AddKeyboardMode(Doc& d);
 
-void Edit(Doc& d, const PcLists& lists)
+void Edit(Doc& d, const PcLists& lists, std::string* note)
 {
     // ---- Options -> Display Settings: DISPLAY MODE + RESOLUTION before DEFAULT. Rows are clones
     // of 3D DEPTH, whose OnTrigger passes the value cursor as an int:
@@ -430,6 +431,21 @@ void Edit(Doc& d, const PcLists& lists)
 
     AddSwitchProfile(d);
     AddSystemFrames(d);
+    // KEYBOARD edits a copy: if the screen is not as measured, only that part is left out.
+    Doc keyboard = d;
+    try { AddKeyboardMode(keyboard); d = std::move(keyboard); }
+    catch (const Fail& e) { if (note) *note = std::string("Controller Setup KEYBOARD mode left out: ") + e.what(); }
+}
+
+// ---- Options -> Controller Setup: KEYBOARD mode (KEYBOARD_PLAN.md). The screen's artwork has room
+// for three rows only (a fourth has no bar and hides EXIT), so player 1's BUTTON SETTINGS row shows
+// CONTROLLER / KEYBOARD in its value text, which the game leaves empty (menu_ext.cpp writes it);
+// it gets the TYPE value's font and alignment.
+void AddKeyboardMode(Doc& d)
+{
+    Node& value = d.Find("StaticTextMenuItemMode007-03-02-1");
+    d.Set(value, "font", "1");
+    d.Set(value, "fontalign", "right");
 }
 
 // ---- Options: SWITCH PROFILE (6th row, the main menu's PROFILE icon). OnEnter is DISPLAY
@@ -596,7 +612,7 @@ void AddSystemFrames(Doc& d)
 
 } // namespace
 
-std::string ApplyPcEdits(const uint8_t* b, size_t size, const PcLists& lists, std::string* why)
+std::string ApplyPcEdits(const uint8_t* b, size_t size, const PcLists& lists, std::string* why, std::string* note)
 {
     try
     {
@@ -611,7 +627,7 @@ std::string ApplyPcEdits(const uint8_t* b, size_t size, const PcLists& lists, st
         size_t p = 16;
         d.roots = ReadList(b, size, p, 0);
         if (p != elemOff) throw Fail("body does not end at the name tables");
-        Edit(d, lists);
+        Edit(d, lists, note);
         std::string body;
         WriteList(d.roots, body);
         std::string out(reinterpret_cast<const char*>(b), 8);
