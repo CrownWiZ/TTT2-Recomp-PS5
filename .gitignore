@@ -12,6 +12,8 @@
 /*
 !/.gitignore
 !/README.md
+!/BUILDING.md
+!/.github/
 !/port/
 !/tools/
 !/re/
@@ -104,3 +106,6 @@ port/*_PLAN.md
 .vscode/
 *.user
 Thumbs.db
+
+# --- README artwork (original, port/tools/make_banner.py) - after the *.png rule above ---
+!/.github/assets/*.png
