@@ -15,9 +15,54 @@
 #include <mutex>
 #include <algorithm>
 #include <cstring>
+#include <string>
 #include <chrono>
 
 extern "C" PPC_FUNC(__imp__sub_82AD8A00);
+extern "C" PPC_FUNC(__imp__sub_82BD3DF0);
+extern "C" PPC_FUNC(__imp__sub_82BD43C0);
+extern "C" PPC_FUNC(__imp__sub_82BD39B0);
+extern "C" PPC_FUNC(__imp__sub_82BD4278);
+
+// TTT2_TRACE_COPY=<text> (or hex:<bytes> for binary needles such as a XUID): log every call of
+// the game's copy routines whose source starts with the needle - which routine, destination,
+// size and the guest call chain - to find where a value (e.g. the default name "Player") is put
+// into a structure. Routines: memcpy 82BD3DF0, strncpy 82BD43C0, memmove 82BD39B0, memcpy (2)
+// 82BD4278; all take r3 dst, r4 src, r5 size.
+static void TraceCopy(const char* routine, PPCContext& ctx, uint8_t* base)
+{
+    static std::string needleBytes = [] {
+        const char* e = std::getenv("TTT2_TRACE_COPY");
+        if (!e) return std::string();
+        if (std::strncmp(e, "hex:", 4) != 0) return std::string(e);
+        std::string b;
+        for (const char* p = e + 4; p[0] && p[1]; p += 2) b.push_back(char(std::strtoul(std::string(p, 2).c_str(), nullptr, 16)));
+        return b;
+    }();
+    const size_t needleLen = needleBytes.size();
+    if (!needleLen || ctx.r5.u32 < needleLen || ctx.r4.u32 < 0x1000 ||
+        std::memcmp(base + ctx.r4.u32, needleBytes.data(), needleLen) != 0)
+        return;
+    static std::atomic<int> logged{ 0 };
+    if (logged++ >= 20000) return;
+    char line[400];
+    int n = std::snprintf(line, sizeof(line), "[copy] %s '%s' %08X -> %08X (%u bytes) lr=%08X chain:", routine,
+                          std::getenv("TTT2_TRACE_COPY"), ctx.r4.u32, ctx.r3.u32, ctx.r5.u32, uint32_t(ctx.lr));
+    uint32_t frame = ctx.r1.u32;
+    for (int i = 0; i < 10 && frame && frame < 0xFFFFFFF0u && n < 360; ++i)
+    {
+        const uint32_t prev = GRead32(base, frame);
+        if (!prev || prev <= frame || prev - frame > 0x10000) break;
+        n += std::snprintf(line + n, sizeof(line) - n, " %08X", GRead32(base, prev - 8));
+        frame = prev;
+    }
+    std::fprintf(stderr, "%s\n", line);
+}
+
+PPC_FUNC(sub_82BD3DF0) { TraceCopy("memcpy", ctx, base); __imp__sub_82BD3DF0(ctx, base); }
+PPC_FUNC(sub_82BD43C0) { TraceCopy("strncpy", ctx, base); __imp__sub_82BD43C0(ctx, base); }
+PPC_FUNC(sub_82BD39B0) { TraceCopy("memmove", ctx, base); __imp__sub_82BD39B0(ctx, base); }
+PPC_FUNC(sub_82BD4278) { TraceCopy("memcpy2", ctx, base); __imp__sub_82BD4278(ctx, base); }
 
 namespace {
 bool DiagBake()

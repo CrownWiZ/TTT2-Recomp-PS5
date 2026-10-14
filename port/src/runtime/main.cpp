@@ -172,6 +172,33 @@ static int g_watchLogged = 0;
 static thread_local bool t_watchStep = false;    // this thread is stepping past the page
 static thread_local uint32_t t_watchPre = 0;     // watched-word value before the write
 static thread_local uint64_t t_watchPc  = 0;     // PC of the writing instruction
+static thread_local uint64_t t_watchStack[12];   // its callers (return-address RVAs)
+static thread_local int t_watchFrames = 0;
+
+// Callers of the faulting instruction, unwound from its context (x64 unwind data).
+static void WatchCaptureStack(const CONTEXT& at, uint64_t modBase)
+{
+    CONTEXT c = at;
+    t_watchFrames = 0;
+    for (int i = 0; i < 12; ++i)
+    {
+        DWORD64 imageBase = 0;
+        PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(c.Rip, &imageBase, nullptr);
+        if (f)
+        {
+            void* handlerData = nullptr;
+            DWORD64 establisher = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, c.Rip, f, &c, &handlerData, &establisher, nullptr);
+        }
+        else
+        {
+            c.Rip = *reinterpret_cast<DWORD64*>(c.Rsp);   // leaf: return address on top
+            c.Rsp += 8;
+        }
+        if (!c.Rip) break;
+        t_watchStack[t_watchFrames++] = c.Rip - modBase;
+    }
+}
 
 static void WatchProtect(bool on)
 {
@@ -192,6 +219,7 @@ static LONG CALLBACK WatchVeh(EXCEPTION_POINTERS* ep)
         {
             t_watchPre = __builtin_bswap32(*reinterpret_cast<uint32_t*>(g_base + g_watchAddr));
             t_watchPc  = reinterpret_cast<uint64_t>(r->ExceptionAddress);
+            WatchCaptureStack(*ep->ContextRecord, reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr)));
             WatchProtect(false);
             ep->ContextRecord->EFlags |= 0x100;  // TF: re-protect after this one instruction
             t_watchStep = true;
@@ -206,8 +234,12 @@ static LONG CALLBACK WatchVeh(EXCEPTION_POINTERS* ep)
         {
             ++g_watchLogged;
             uint64_t modBase = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
-            std::fprintf(stderr, "[watch] 0x%08X: %08X -> %08X pc RVA=0x%llX\n",
-                g_watchAddr, t_watchPre, now, (unsigned long long)(t_watchPc - modBase));
+            char stack[12 * 12 + 1] = {};
+            int at = 0;
+            for (int i = 0; i < t_watchFrames; ++i)
+                at += std::snprintf(stack + at, sizeof(stack) - at, " %llX", (unsigned long long)t_watchStack[i]);
+            std::fprintf(stderr, "[watch] 0x%08X: %08X -> %08X pc RVA=0x%llX callers:%s\n",
+                g_watchAddr, t_watchPre, now, (unsigned long long)(t_watchPc - modBase), stack);
         }
         WatchProtect(true);
         return EXCEPTION_CONTINUE_EXECUTION;
@@ -502,15 +534,18 @@ int main(int argc, char** argv)
     }
     std::thread([] {
         bool vehInstalled = g_watchAddr != 0;
+        // TTT2_INSTANCE=<tag>: watch<tag>.txt, so two instances can be armed separately.
+        const char* tag = std::getenv("TTT2_INSTANCE");
+        const std::string watchFile = std::string("C:/ttt2/port/watch") + (tag ? tag : "") + ".txt";
         for (;;)
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            FILE* f = std::fopen("C:/ttt2/port/watch.txt", "rb");
+            FILE* f = std::fopen(watchFile.c_str(), "rb");
             if (!f) continue;
             char text[32] = {};
             std::fread(text, 1, sizeof(text) - 1, f);
             std::fclose(f);
-            DeleteFileA("C:/ttt2/port/watch.txt");
+            DeleteFileA(watchFile.c_str());
             const uint32_t addr = static_cast<uint32_t>(std::strtoul(text, nullptr, 16));
             if (!addr) continue;
             if (g_watchAddr) WatchProtect(false);

@@ -93,9 +93,11 @@ int Fail(uint32_t error) { t_error = error; return -1; }
 void TraceBytes(const char* what, uint32_t handle, uint32_t addr, uint16_t port, const uint8_t* data, int n)
 {
     if (!Trace()) return;
-    char hex[80] = {};
+    // TTT2_NET_TRACE=2: whole payloads (up to 2 KB); otherwise the first 24 bytes.
+    static const int limit = [] { const char* e = std::getenv("TTT2_NET_TRACE"); return e && *e == '2' ? 2048 : 24; }();
+    char hex[4100] = {};
     int at = 0;
-    for (int i = 0; i < n && i < 24; ++i) at += std::snprintf(hex + at, sizeof(hex) - at, "%02X", data[i]);
+    for (int i = 0; i < n && i < limit; ++i) at += std::snprintf(hex + at, sizeof(hex) - at, "%02X", data[i]);
     std::fprintf(stderr, "[xsocket] %s %08X %u.%u.%u.%u:%u %d bytes %s\n", what, handle, addr >> 24, (addr >> 16) & 0xFF,
                  (addr >> 8) & 0xFF, addr & 0xFF, port, n, hex);
 }
@@ -158,14 +160,23 @@ void Receive(uint64_t from, net::Channel, const uint8_t* data, size_t size)
     switch (h.op)
     {
     case Op::Datagram:
+    {
+        bool delivered = false;
         for (auto& [handle, s] : g_sockets)
             if (s.kind == Kind::Datagram && s.bound && s.port == h.dstPort && s.proto == h.proto)
             {
                 if (s.datagrams.size() < 512)
+                {
                     s.datagrams.push_back({ fromAddr, h.srcPort, std::vector<uint8_t>(payload, payload + payloadSize) });
+                    delivered = true;
+                }
                 break;
             }
+        if (!delivered && Trace())
+            std::fprintf(stderr, "[xsocket] rx datagram DROPPED: no socket bound to proto %u port %u (or queue full)\n",
+                         h.proto, h.dstPort);
         break;
+    }
     case Op::Syn:
     {
         Socket* listener = nullptr;

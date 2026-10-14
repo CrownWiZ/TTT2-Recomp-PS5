@@ -184,6 +184,13 @@ PPC_FUNC(__imp__XamUserReadProfileSettings)
 {
     KTrace("XamUserReadProfileSettings");
     uint32_t bufferSize = ctx.r9.u32, buffer = ctx.r10.u32;
+    if (std::getenv("TTT2_XLIVE_TRACE"))
+    {
+        const uint32_t xuidCount = ctx.r5.u32, xuids = ctx.r6.u32, settingCount = ctx.r7.u32, ids = ctx.r8.u32;
+        std::fprintf(stderr, "[xam] XamUserReadProfileSettings(user %u, %u xuids first %08X%08X, %u settings first %08X, buffer %08X) lr=%08X\n",
+                     ctx.r4.u32, xuidCount, xuids && xuidCount ? GRead32(base, xuids) : 0u, xuids && xuidCount ? GRead32(base, xuids + 4) : 0u,
+                     settingCount, ids && settingCount ? GRead32(base, ids) : 0u, buffer, uint32_t(ctx.lr));
+    }
     if (buffer)
     {
         uint32_t n = bufferSize ? GRead32(base, bufferSize) : 0;
