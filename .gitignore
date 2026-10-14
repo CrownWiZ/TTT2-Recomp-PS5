@@ -109,3 +109,5 @@ Thumbs.db
 
 # --- README artwork (original, port/tools/make_banner.py) - after the *.png rule above ---
 !/.github/assets/*.png
+# README screenshots (.github/assets/screens/*.jpg): captures of the port running, added at the
+# owner's request (2026-10-14) - the only game imagery allowed in the repository.

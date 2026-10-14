@@ -22,6 +22,10 @@
   <img src="https://img.shields.io/github/downloads/shihabal3amri/tekken-tag-tournament-2-pc/total?style=flat-square&label=downloads&color=555" alt="Downloads">
 </p>
 
+<p align="center">
+  <img src=".github/assets/screens/00-hero-lei-china.jpg" alt="Lei Wulong and Kunimitsu fighting on the China stage" width="100%">
+</p>
+
 ---
 
 ## Why you'll love it
@@ -63,6 +67,45 @@
     </td>
   </tr>
 </table>
+
+---
+
+## Screenshots
+
+<table>
+  <tr>
+    <td width="50%" align="center">
+      <img src=".github/assets/screens/01-character-select.jpg" alt="Character select with the full roster" width="100%"><br>
+      <sub>Every fighter, unlocked from the start</sub>
+    </td>
+    <td width="50%" align="center">
+      <img src=".github/assets/screens/02-tag-vs-screen.jpg" alt="Tag battle VS screen: Combot and P. Jack vs Alex and Angel" width="100%"><br>
+      <sub>Tag battles: two fighters a side</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" align="center">
+      <img src=".github/assets/screens/03-jungle-jin-vs-jun.jpg" alt="Jin Kazama and Jun Kazama fighting in the jungle" width="100%"><br>
+      <sub>Jin vs Jun in the Tropical Rainforest</sub>
+    </td>
+    <td width="50%" align="center">
+      <img src=".github/assets/screens/04-fight-china.jpg" alt="FIGHT! at the start of a round on the China stage" width="100%"><br>
+      <sub>Round start in China</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" align="center">
+      <img src=".github/assets/screens/05-tag-intro-alex-angel.jpg" alt="Alex and Angel tag-team intro" width="100%"><br>
+      <sub>The original intros and finishing touches</sub>
+    </td>
+    <td width="50%" align="center">
+      <img src=".github/assets/screens/06-fire-hit-china.jpg" alt="A fire hit effect on the China stage" width="100%"><br>
+      <sub>Full hit effects</sub>
+    </td>
+  </tr>
+</table>
+
+<p align="center"><sub>Captured from the port itself, rendered at 2x (1440p) and scaled to 720p.</sub></p>
 
 ---
 
