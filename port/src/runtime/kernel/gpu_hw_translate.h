@@ -26,6 +26,7 @@ struct PsTranslation
     std::string function;        // HLSL: XOut XenosPs(float4 inputs[16])
     uint32_t textureSlots = 0;   // bitmask of fetch-constant slots sampled
     uint32_t cubeSlots = 0;      // of those, slots fetched as cubes (bound as Texture2DArray)
+    bool writesDepth = false;    // exports oDepth (export 61, X): the function sets eDepth / wroteDepth
     std::string unsupported;     // non-empty: the shader cannot be translated
 };
 
@@ -200,6 +201,7 @@ public:
     std::vector<VsFetch> fetches;
     uint32_t lastSlot = ~0u, lastStride = 0;   // vfetch_mini state, in program order (as RunShader)
     bool r0Written = false;           // the vertex index register may no longer hold the index
+    bool depthExport = false;         // pixel shader writes oDepth (export 61)
 
     std::string R(uint32_t i)
     {
@@ -280,12 +282,20 @@ public:
         }
     }
 
-    // Where an export lands: pixel shaders observe colour export 0 only (as on CPU); vertex
-    // shaders the position (62, which also marks the vertex valid) and interpolators 0-15.
+    // Where an export lands: pixel shaders observe colour export 0 and the depth (61, X - TTT2's
+    // half-resolution scene depth for soft particles is written this way); vertex shaders the
+    // position (62, which also marks the vertex valid) and interpolators 0-15.
     // Empty = not observable here (point size, memexport, other render targets).
     std::string ExportTarget(uint32_t dst)
     {
-        if (!vertex) return dst == 0 ? "e0" : "";
+        if (!vertex)
+        {
+            if (dst == 0) return "e0";
+            if (dst != 61) return "";
+            depthExport = true;
+            out << "        wroteDepth = true;\n";
+            return "eDepth";
+        }
         if (dst == 62) { out << "        wrotePos = true;\n"; return "oPos"; }
         if (dst < 16) return "oI[" + Num(dst) + "]";
         return "";
@@ -792,6 +802,10 @@ inline PsTranslation TranslatePixelShader(const std::vector<uint32_t>& code, boo
         if (w.textures & (1u << slot))
             f << ((w.cubeSlots >> slot) & 1 ? "Texture2DArray<float4> tex" : "Texture2D<float4> tex") << slot
               << " : register(t" << slot << ");\n";
+    // Only depth-writing shaders declare these, so every other shader's HLSL (and its disk
+    // cache entry) is unchanged.
+    if (w.depthExport)
+        f << "static float4 eDepth = float4(0, 0, 0, 0);\nstatic bool wroteDepth = false;\n";
     f << "XOut XenosPs(float4 inputs[16])\n{\n";
     if (w.arrayRegs)
         f << "    float4 r[64];\n"
@@ -809,17 +823,20 @@ inline PsTranslation TranslatePixelShader(const std::vector<uint32_t>& code, boo
     result.function = f.str();
     result.textureSlots = w.textures;
     result.cubeSlots = w.cubeSlots;
+    result.writesDepth = w.depthExport;
     return result;
 }
 
-// Complete pixel shader: translated body + kill + alpha test (RB_COLORCONTROL semantics).
+// Complete pixel shader: translated body + kill + alpha test (RB_COLORCONTROL semantics). A
+// depth-exporting shader also outputs SV_Depth: the exported X clamped to 0..1 like Xenia (host
+// depth holds the guest's window z), or the rasterized depth on paths that never export it.
 inline std::string PixelShaderHlsl(const PsTranslation& t)
 {
     return std::string(PsPrelude()) + t.function + R"(
 struct PSIn { float4 pos : SV_Position; float4 a[16] : TEXCOORD0; };
-float4 main(PSIn input) : SV_Target
+)" + (t.writesDepth ? "float4 main(PSIn input, out float oDepth : SV_Depth) : SV_Target" : "float4 main(PSIn input) : SV_Target") + R"(
 {
-    XOut o = XenosPs(input.a);
+    XOut o = XenosPs(input.a);)" + (t.writesDepth ? "\n    oDepth = wroteDepth ? saturate(eDepth.x) : input.pos.z;" : "") + R"(
     if (o.killed) discard;
     if (alphaTest != 0)
     {
