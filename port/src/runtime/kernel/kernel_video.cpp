@@ -55,6 +55,24 @@ static std::atomic<bool> g_tickStarted{false};
 
 static constexpr uint32_t MMIO_SWAP_STATUS = 0x7FC86544u;   // reg 0x6544, bit0 = swap pending
 
+// GPU progress: bumped after every guest-memory write the GPU side makes - the command
+// processor's fences, memory writes and read-pointer writeback, and each guest interrupt
+// callback (the vblank / swap DPC tokens). Waiters on GPU-written values sleep on it
+// (WaitOnAddress) instead of spinning: guest_monitor.cpp's D3D wait, WaitRegMem below.
+std::atomic<uint32_t> g_gpuProgress{0};
+void GpuProgress()
+{
+    g_gpuProgress.fetch_add(1, std::memory_order_release);
+    WakeByAddressAll(&g_gpuProgress);
+}
+// Sleep until GpuProgress moves past `seen`, at most `ms` (true: it moved).
+bool WaitGpuProgress(uint32_t seen, DWORD ms)
+{
+    if (g_gpuProgress.load(std::memory_order_acquire) != seen) return true;
+    WaitOnAddress(&g_gpuProgress, &seen, sizeof(seen), ms);
+    return g_gpuProgress.load(std::memory_order_acquire) != seen;
+}
+
 // The D3D runtime hands the kernel PHYSICAL addresses (virtual & 0x1FFFFFFF). GPU-visible
 // allocations come from the physical heap at guest 0xA0000000+, so map them back.
 static uint32_t PhysToGuest(uint32_t addr)
@@ -68,6 +86,7 @@ static uint32_t PhysToGuest(uint32_t addr)
 // for headless verification). Even a black frame proves the flip chain end-to-end.
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "synchronization.lib")
 
 static std::atomic<uint32_t> g_frontBufferPhys{0};   // guest address of the displayed surface
 // The displayed surface's fetch-constant swizzle (12 bits). TTT2's is .zyx1 (0xA0A): it swaps
@@ -163,7 +182,7 @@ static LRESULT CALLBACK GameWndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_CLOSE:
         std::fprintf(stderr, "[window] closed - quitting\n");
         std::fflush(stderr);
-        TerminateProcess(GetCurrentProcess(), 0);
+        LogDrain(); TerminateProcess(GetCurrentProcess(), 0);
         return 0;
     case WM_SYSKEYDOWN:
         if (wp == VK_RETURN && (lp & (1 << 29)))
@@ -274,7 +293,9 @@ static unsigned __stdcall PresentThread(void*)
                 if (!exclusive) ApplyWindowMode(wnd);
                 applied = generation;
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            static const bool msgWait = [] { const char* e = std::getenv("TTT2_WINDOW_MSGWAIT"); return e && *e == '1'; }();
+            if (msgWait) MsgWaitForMultipleObjects(0, nullptr, FALSE, 5, QS_ALLINPUT);
+            else std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
     }
     static uint32_t staging[FB_W * FB_H];
@@ -342,6 +363,8 @@ std::atomic<uint64_t> g_cpPresents{0}, g_gameSwaps{0};
 // (guest CPU frame) and between the command processor's presents (GPU emulation + D3D11),
 // a 10 s summary per stream (frames, intervals over 17.5/25/33/50 ms, longest) and one line
 // per interval over 25 ms. Each timer is used by one thread only.
+void HitchRegisterThread(const char* name);   // diag_hooks.cpp (TTT2_HITCH_PROFILE=3)
+void HitchFrameGap(double ms);
 static bool FrameTimeLog()
 {
     static const bool on = [] { const char* e = std::getenv("TTT2_FRAMETIME"); return e && *e == '1'; }();
@@ -362,6 +385,7 @@ struct FrameTimer
             ++frames;
             over17 += ms > 17.5, over25 += ms > 25, over33 += ms > 33.4, over50 += ms > 50;
             longest = (std::max)(longest, ms);
+            if (ms > 25 && name[0] == 'p') HitchFrameGap(ms);
             if (ms > 25)
                 std::fprintf(stderr, "[frame] %s gap %.1f ms (swaps %llu presents %llu, present call %.1f ms)\n", name, ms,
                              (unsigned long long)g_gameSwaps.load(), (unsigned long long)g_cpPresents.load(),
@@ -425,11 +449,35 @@ static void HwPresentFrame(uint32_t fb)
         const char* e = std::getenv("TTT2_FBSEQ");
         return e ? (int)std::strtol(e, nullptr, 0) : 0;
     }();
-    const bool seq = seqEvery > 0 && frames % (uint32_t)seqEvery == 0;
+    // A burst on request (TTT2_FBDUMP=request): fbdump.request holding "seq <count> <every>" writes
+    // <count> frames, one every <every> presents, as port/fb/burst_NNNN.bmp (a short scene such as a
+    // fight intro, without TTT2_FBSEQ dumping the whole run).
+    static uint32_t burstLeft = 0, burstEvery = 1, burstIndex = 0;
+    const bool burst = burstLeft && frames % burstEvery == 0;
+    const bool seq = (seqEvery > 0 && frames % (uint32_t)seqEvery == 0) || burst;
     // fbdump.bmp every 60 presents (nav.py's screenshots); TTT2_FBDUMP=0 (installed copies) skips
-    // the read-back.
-    static const bool fbdump = [] { const char* e = std::getenv("TTT2_FBDUMP"); return !(e && *e == '0'); }();
-    const bool dump = fbdump && frames % 60 == 0;
+    // the read-back. TTT2_FBDUMP=request writes it only when fbdump.request appears (nav.py asks),
+    // so timing runs have no periodic read-back stall.
+    static const int fbdump = [] {
+        const char* e = std::getenv("TTT2_FBDUMP");
+        return (e && *e == '0') ? 0 : (e && std::strcmp(e, "request") == 0) ? 2 : 1;
+    }();
+    static const std::string request = [] {
+        const char* tag = std::getenv("TTT2_INSTANCE");
+        return std::string("C:/ttt2/port/fbdump") + (tag ? tag : "") + ".request";
+    }();
+    bool dump = fbdump == 1 && frames % 60 == 0;
+    if (fbdump == 2 && frames % 10 == 0 && GetFileAttributesA(request.c_str()) != INVALID_FILE_ATTRIBUTES)
+    {
+        unsigned count = 0, every = 1;
+        if (FILE* f = std::fopen(request.c_str(), "r"))
+        {
+            if (std::fscanf(f, "seq %u %u", &count, &every) != 2) count = 0;
+            std::fclose(f);
+        }
+        if (count) { burstLeft = count; burstEvery = (std::max)(1u, every); burstIndex = 0; DeleteFileA(request.c_str()); }
+        else dump = DeleteFileA(request.c_str()) != 0;
+    }
     if (seq || dump)
     {
         static std::vector<uint32_t> staging(FB_W * FB_H);
@@ -439,7 +487,12 @@ static void HwPresentFrame(uint32_t fb)
             {
                 CreateDirectoryA("C:/ttt2/port/fb", nullptr);
                 char fp[128];
-                BoundedSnprintf(fp, sizeof(fp), "C:/ttt2/port/fb/frame_%04u.bmp", frames / (uint32_t)seqEvery);
+                if (burst)
+                {
+                    BoundedSnprintf(fp, sizeof(fp), "C:/ttt2/port/fb/burst_%04u.bmp", burstIndex++);
+                    --burstLeft;
+                }
+                else BoundedSnprintf(fp, sizeof(fp), "C:/ttt2/port/fb/frame_%04u.bmp", frames / (uint32_t)seqEvery);
                 WriteBmpTo(fp, staging.data());
             }
             if (dump)
@@ -496,8 +549,13 @@ static void InitGpuTrace()
     if (g_drawDump < 0) g_drawDump = EnvInt("TTT2_DRAWDUMP", 8);
 }
 
+// TTT2_SHADER_DUMP=1: write each new shader's microcode to port/shaders (bring-up). Off by
+// default: it hashed every shader load and wrote a file + log line per new shader on the CP
+// thread, exactly when a fight starts or a new effect appears.
 static void DumpShaderBlob(uint32_t type, uint32_t addr, uint32_t sizeDwords)
 {
+    static const bool on = [] { const char* e = std::getenv("TTT2_SHADER_DUMP"); return e && *e == '1'; }();
+    if (!on) return;
     uint64_t h = 1469598103934665603ull;                      // FNV-1a over the ucode
     for (uint32_t i = 0; i < sizeDwords; ++i)
     {
@@ -722,6 +780,26 @@ static void FrameLogDraw(uint32_t init)
         ci & 0xFFF, (ci >> 16) & 15, ((int32_t)(ci << 6)) >> 26, r[0x2104] & 0xFFFF,
         r[0x2003], r[0x2004], r[0x2005], di & 0xFFF, (di >> 16) & 1, r[0x2200], r[0x2201], r[0x2209],
         r[0x2205], r[0x2206], g_curVs, g_curVsSize, g_curPs, g_curPsSize, r[0x2180], r[0x2181]);
+    if (g_curPs && g_curPsSize && g_curPsSize < 4096)
+    {
+        // The pixel shader's microcode hash, as TTT2_SHADER_DUMP names port/shaders/ps_<hash>.bin
+        // (written here too, so the frame's shaders can be disassembled with ucode_disasm.py).
+        uint64_t h = 1469598103934665603ull;
+        for (uint32_t i = 0; i < g_curPsSize; ++i) { h ^= GRead32(g_base, g_curPs + i * 4); h *= 1099511628211ull; }
+        std::fprintf(g_frameLog, "    ps hash %016llX\n", (unsigned long long)h);
+        char path[128];
+        BoundedSnprintf(path, sizeof(path), "C:/ttt2/port/shaders/ps_%016llX.bin", (unsigned long long)h);
+        if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES)
+            if (FILE* f = std::fopen(path, "wb"))
+            {
+                for (uint32_t i = 0; i < g_curPsSize; ++i)
+                {
+                    const uint32_t w = GRead32(g_base, g_curPs + i * 4);
+                    std::fwrite(&w, 4, 1, f);
+                }
+                std::fclose(f);
+            }
+    }
     if (mode == 6)
     {
         const uint32_t cc = r[0x2318], info = r[0x231B];
@@ -1064,7 +1142,7 @@ static void WriteReg(uint32_t reg, uint32_t value)
         g_regFile[reg] = value;
         GWrite32(g_base, 0x7FC80000u + reg * 4, value);   // guest-visible register aperture
     }
-    if (reg >= 0x578 && reg <= 0x57F) MirrorScratch(reg, value);
+    if (reg >= 0x578 && reg <= 0x57F) { MirrorScratch(reg, value); GpuProgress(); }
     if (reg >= 0x1922 && reg <= 0x1925) GammaRegisterWritten(reg, value);
 }
 
@@ -1130,6 +1208,7 @@ static void RaiseCpInterrupt(uint32_t cpuMask)
         GuestCall2(cb, 1, dev);        // source 1: the ISR calls [shadow+16]([shadow+20])
     }
     GuestSetCurrentCpu(0);
+    GpuProgress();
 }
 
 // Command-processor time split for TTT2_FRAMETIME=1 (CP thread only): WAIT_REG_MEM time by
@@ -1161,6 +1240,30 @@ struct CpWaitClock
         }
     }
 };
+
+static bool CpWaitYield()
+{
+    static const bool yield = [] { const char* e = std::getenv("TTT2_CP_WAIT"); return e && std::strcmp(e, "yield") == 0; }();
+    return yield;
+}
+// TTT2_FRAMETIME=1: waits whose value turned up only after a 1 ms sleep ran out (written
+// without a GpuProgress bump), counted by address and printed every 600.
+static void CpWaitLateWake(uint32_t pollOn)
+{
+    static std::mutex m;
+    static std::unordered_map<uint32_t, uint32_t> counts;
+    static uint32_t total = 0;
+    if (!FrameTimeLog()) return;
+    std::lock_guard l(m);
+    ++counts[pollOn];
+    if (++total % 600 != 0) return;
+    char line[512];
+    int n = BoundedSnprintf(line, sizeof(line), "[frame] cp waits woken late (no progress bump), %u so far:", total);
+    for (const auto& [a, c] : counts)
+        if (n < 440) n += BoundedSnprintf(line + n, sizeof(line) - n, " %08X=%u", a, c);
+    BoundedSnprintf(line + n, sizeof(line) - n, "\n");
+    std::fputs(line, stderr);
+}
 
 // Wait until (value & mask) <func> ref, polling guest memory or the register file.
 static bool WaitRegMem(uint32_t waitInfo, uint32_t pollOn, uint32_t ref, uint32_t mask)
@@ -1195,8 +1298,10 @@ static bool WaitRegMem(uint32_t waitInfo, uint32_t pollOn, uint32_t ref, uint32_
     bool traced = pollOn == 0x13EB4506u && wlog.fetch_sub(1) > 0;
     uint32_t firstSeen = 0xDEADBEEF;
     auto t0 = std::chrono::steady_clock::now();
+    bool timedOut = false;
     for (uint64_t spins = 0;; ++spins)
     {
+        const uint32_t progress = g_gpuProgress.load(std::memory_order_acquire);
         if (memSpace) SyncGuestScratchWrites();
         uint32_t v;
         if (memSpace && pollOn < 0x1000)
@@ -1238,18 +1343,26 @@ static bool WaitRegMem(uint32_t waitInfo, uint32_t pollOn, uint32_t ref, uint32_
                 std::fprintf(stderr, "[wrm] PASS poll=%08X first=%08X after %lld us\n",
                              pollOn, firstSeen, (long long)us);
             }
+            if (timedOut) CpWaitLateWake(pollOn);
             return false;
         }
-        // Fast polling: yield first (Windows sleep_for(500us) really costs ~15ms and
-        // turned every failing wait into a multi-second CP stall); real 3 s deadline.
-        // Yield for up to a frame and a half before sleeping: these waits are the frame
-        // pacing handshake (vblank token, fences), and a 1 ms sleep granularity on them was
-        // measured eating into every frame's 16.7 ms budget.
         const auto now = std::chrono::steady_clock::now();
-        if (spins < 20000 || now - t0 < std::chrono::milliseconds(25)) std::this_thread::yield();
-        else if (now < deadline)
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        else break;
+        if (now >= deadline) break;
+        if (CpWaitYield())
+        {
+            // TTT2_CP_WAIT=yield: the old loop - yield for up to a frame and a half (Windows
+            // sleep_for(500us) really costs ~15 ms), then 1 ms sleeps; real 3 s deadline.
+            if (spins < 20000 || now - t0 < std::chrono::milliseconds(25)) std::this_thread::yield();
+            else std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            continue;
+        }
+        // The values these waits poll (the vblank token, the fence handshake) are written by
+        // the vblank interrupt and the command stream, which bump GpuProgress: sleep on it
+        // instead of yielding. MEASURED 2026-10-15: the yield loop cost the CP thread ~250 ms/s
+        // of kernel calls in fights. A short pause-spin first catches an imminent write; the
+        // 1 ms cap bounds a write nobody announces (a guest store to the register aperture).
+        for (int i = 0; i < 200 && g_gpuProgress.load(std::memory_order_acquire) == progress; ++i) _mm_pause();
+        timedOut = !WaitGpuProgress(progress, 1);     // the last sleep ran out: no bump announced the write
     }
     uint32_t sh = ScratchShadow();
     std::fprintf(stderr,
@@ -1297,7 +1410,7 @@ static uint32_t LatchImmediateShader(uint32_t stage, uint32_t source, uint32_t w
         std::fprintf(stderr, "[pm4-fault] invalid immediate shader upload stage=%u source=%08X words=%u\n",
                      stage, source, words);
         std::fflush(stderr);
-        TerminateProcess(GetCurrentProcess(), 6);
+        LogDrain(); TerminateProcess(GetCurrentProcess(), 6);
         std::abort();
     }
     uint32_t& destination = programs[stage == 0 ? 0 : 1];
@@ -1308,7 +1421,7 @@ static uint32_t LatchImmediateShader(uint32_t stage, uint32_t source, uint32_t w
         {
             std::fputs("[pm4-fault] cannot allocate shader program storage\n", stderr);
             std::fflush(stderr);
-            TerminateProcess(GetCurrentProcess(), 6);
+            LogDrain(); TerminateProcess(GetCurrentProcess(), 6);
             std::abort();
         }
         destination = GuestAddr(g_base, allocation);
@@ -1343,7 +1456,7 @@ static void CheckPacketBoundary(uint32_t address, uint32_t header, uint32_t star
                      GRead32(g_base, uint32_t(p)), GRead32(g_base, uint32_t(p + 4)),
                      GRead32(g_base, uint32_t(p + 8)), GRead32(g_base, uint32_t(p + 12)));
     std::fflush(stderr);
-    TerminateProcess(GetCurrentProcess(), 6);
+    LogDrain(); TerminateProcess(GetCurrentProcess(), 6);
     std::abort();
 }
 
@@ -1355,7 +1468,7 @@ static void ExecPacketStream(uint32_t addr, uint32_t sizeBytes, int depth)
         std::fprintf(stderr, "[pm4-fault] invalid stream range %08X+%X d=%d\n",
                      addr, sizeBytes, depth);
         std::fflush(stderr);
-        TerminateProcess(GetCurrentProcess(), 6);
+        LogDrain(); TerminateProcess(GetCurrentProcess(), 6);
         std::abort();
     }
     uint32_t start = addr;
@@ -1542,6 +1655,7 @@ static void ExecPacketStream(uint32_t addr, uint32_t sizeBytes, int depth)
                     {
                         if (memWrite) GWrite32(g_base, PhysToGuest(wa & ~3u), wd);
                         else WriteReg(wa & 0x7FFF, wd);
+                        GpuProgress();
                     }
                 }
             }
@@ -1634,6 +1748,7 @@ static void ExecPacketStream(uint32_t addr, uint32_t sizeBytes, int depth)
                 uint32_t dst = PhysToGuest(GRead32(g_base, addr + 4) & ~3u);
                 uint32_t val = GRead32(g_base, addr + 8);
                 if (dst) GWrite32(g_base, dst, val);
+                GpuProgress();
                 static int flog = 0;
                 if (flog < 24)
                 {
@@ -1646,6 +1761,7 @@ static void ExecPacketStream(uint32_t addr, uint32_t sizeBytes, int depth)
                 uint32_t dst = PhysToGuest(GRead32(g_base, addr) & ~3u);
                 for (uint32_t i = 1; i < cnt && dst; ++i)
                     GWrite32(g_base, dst + (i - 1) * 4, GRead32(g_base, addr + i * 4));
+                GpuProgress();
             }
             else if (op == 0x3C && cnt >= 5)                     // WAIT_REG_MEM
             {
@@ -1675,7 +1791,7 @@ static void ExecPacketStream(uint32_t addr, uint32_t sizeBytes, int depth)
                 // Continuing previously called the intentionally disarmed callback.
                 std::fputs("[pm4-fault] fence wait failed; stopping command execution\n", stderr);
                 std::fflush(stderr);
-                TerminateProcess(GetCurrentProcess(), 6);
+                LogDrain(); TerminateProcess(GetCurrentProcess(), 6);
                 std::abort();
             }
             }
@@ -1784,7 +1900,7 @@ static void ConsumeRing()
                 {
                     std::fputs("[pm4-fault] cannot allocate wrapped-packet staging\n", stderr);
                     std::fflush(stderr);
-                    TerminateProcess(GetCurrentProcess(), 6);
+                    LogDrain(); TerminateProcess(GetCurrentProcess(), 6);
                     std::abort();
                 }
                 staging = GuestAddr(g_base, allocation);
@@ -1801,7 +1917,7 @@ static void ConsumeRing()
             rb + result.offset, result.header, result.required, result.remaining,
             rb, rs, g_ringRptr.load(), wptrOff);
         std::fflush(stderr);
-        TerminateProcess(GetCurrentProcess(), 6);
+        LogDrain(); TerminateProcess(GetCurrentProcess(), 6);
         std::abort();
     }
     g_ringRptr.store(result.offset);
@@ -1812,6 +1928,7 @@ static void ConsumeRing()
     // ring-space wait (sub_82738830) forever - hardware never exposes that state.
     if (uint32_t wb = g_rptrWriteBack.load())
         GWrite32(g_base, wb, (result.offset / 4) & ~0x3Fu);
+    GpuProgress();
 }
 
 // The CP thread: consume as soon as work is published. While frames are flowing the game kicks
@@ -1822,6 +1939,7 @@ static void ConsumeRing()
 static void CommandProcessorThread()
 {
     InitGpuTrace();
+    HitchRegisterThread("cp");
     auto lastWork = std::chrono::steady_clock::now();
     auto loopEnd = lastWork, report = lastWork;
     for (;;)
@@ -2008,6 +2126,7 @@ static void VideoTick()
             // unconditionally, which holds 0x0BADF00D between fence sequences).
             GuestSetCurrentCpu(0);
             GuestCall2(cb, 0, ctxArg);
+            GpuProgress();
             if (ticks % 600 == 0)
             {
                 uint32_t rb2 = g_ringBase.load(), rs2 = g_ringSize.load(), dev2 = g_intrContext.load();
@@ -2312,6 +2431,8 @@ PPC_FUNC(__imp__VdSwap)
     {
         static FrameTimer swaps{ "swap" };
         swaps.Mark();
+        static const bool once = (std::fprintf(stderr, "[frame] VdSwap thread %lu\n", GetCurrentThreadId()), true);
+        (void)once;
     }
     static int swaps = 0;
     if (swaps < 5)

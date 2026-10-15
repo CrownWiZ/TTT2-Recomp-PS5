@@ -23,21 +23,40 @@ PPC_FUNC(__imp__KeGetCurrentProcessType)
 // --- critical sections (guest CRITICAL_SECTION lives in guest memory; ~0x1C bytes) ---
 // The guest struct is treated as an opaque key: each guest address gets a host recursive
 // mutex, so recursion and cross-thread blocking behave like the real Rtl API. Entries are
-// never destroyed (a game may leak/reinit sections; a locked mutex must stay valid).
-static std::shared_mutex g_csMapLock;
-static std::unordered_map<uint32_t, std::unique_ptr<std::recursive_mutex>> g_csMap;
-
-static std::recursive_mutex& CsFor(uint32_t ga)
+// never destroyed (a game may leak/reinit sections; a locked mutex must stay valid), so each
+// thread caches the ones it uses: the guest heap takes its section on every allocation and
+// free, and a shared map lock + hash lookup per call (plus a global owner map) weighed on a
+// fight's effect set-up (thousands of small allocations, a 100 ms hitch).
+struct CsEntry
 {
+    std::recursive_mutex m;
+    std::atomic<uint32_t> ownerLr{ 0 };          // last acquirer, for the slow-acquire log
+    std::atomic<unsigned long> ownerTid{ 0 };
+};
+static std::shared_mutex g_csMapLock;
+static std::unordered_map<uint32_t, std::unique_ptr<CsEntry>> g_csMap;
+
+static CsEntry& CsFor(uint32_t ga)
+{
+    struct Slot { uint32_t ga; CsEntry* e; };
+    thread_local Slot cache[64]{};
+    Slot& c = cache[((ga >> 3) ^ (ga >> 9)) & 63];
+    if (c.e && c.ga == ga) return *c.e;
+    CsEntry* e = nullptr;
     {
         std::shared_lock rl(g_csMapLock);
         auto it = g_csMap.find(ga);
-        if (it != g_csMap.end()) return *it->second;
+        if (it != g_csMap.end()) e = it->second.get();
     }
-    std::unique_lock wl(g_csMapLock);
-    auto& slot = g_csMap[ga];
-    if (!slot) slot = std::make_unique<std::recursive_mutex>();
-    return *slot;
+    if (!e)
+    {
+        std::unique_lock wl(g_csMapLock);
+        auto& slot = g_csMap[ga];
+        if (!slot) slot = std::make_unique<CsEntry>();
+        e = slot.get();
+    }
+    c = { ga, e };
+    return *e;
 }
 
 PPC_FUNC(__imp__RtlInitializeCriticalSection)
@@ -53,50 +72,45 @@ PPC_FUNC(__imp__RtlInitializeCriticalSectionAndSpinCount)
 }
 // Slow-acquisition diagnostics: report any CS wait >50ms with the waiter's guest lr and
 // the holder's last-known lock site, to find lock-held-across-slow-work stalls.
-namespace {
-std::mutex g_csOwnerMutex;
-struct CsOwnerInfo { uint32_t lr; unsigned long tid; };
-std::unordered_map<uint32_t, CsOwnerInfo> g_csOwners;
-}
 PPC_FUNC(__imp__RtlEnterCriticalSection)
 {
     KTrace("RtlEnterCriticalSection");
-    auto& m = CsFor(ctx.r3.u32);
-    if (!m.try_lock())
+    CsEntry& cs = CsFor(ctx.r3.u32);
+    if (!cs.m.try_lock())
     {
         auto t0 = std::chrono::steady_clock::now();
-        m.lock();
+        cs.m.lock();
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                       std::chrono::steady_clock::now() - t0).count();
         if (ms > 50)
         {
-            CsOwnerInfo prev{};
-            {
-                std::lock_guard lk(g_csOwnerMutex);
-                auto it = g_csOwners.find(ctx.r3.u32);
-                if (it != g_csOwners.end()) prev = it->second;
-            }
             static std::atomic<int> slowLog{0};
             if (slowLog++ < 60)
                 std::fprintf(stderr,
                     "[cs] slow acquire cs=%08X waited=%lldms waiter_lr=%08X prev_owner_lr=%08X tid=%lu\n",
-                    ctx.r3.u32, (long long)ms, (uint32_t)ctx.lr, prev.lr, prev.tid);
+                    ctx.r3.u32, (long long)ms, (uint32_t)ctx.lr, cs.ownerLr.load(std::memory_order_relaxed),
+                    cs.ownerTid.load(std::memory_order_relaxed));
         }
     }
-    {
-        std::lock_guard lk(g_csOwnerMutex);
-        g_csOwners[ctx.r3.u32] = { (uint32_t)ctx.lr, GetCurrentThreadId() };
-    }
+    cs.ownerLr.store((uint32_t)ctx.lr, std::memory_order_relaxed);
+    cs.ownerTid.store(GetCurrentThreadId(), std::memory_order_relaxed);
 }
 PPC_FUNC(__imp__RtlLeaveCriticalSection)
 {
     KTrace("RtlLeaveCriticalSection");
-    CsFor(ctx.r3.u32).unlock();
+    CsFor(ctx.r3.u32).m.unlock();
 }
 PPC_FUNC(__imp__RtlTryEnterCriticalSection)
 {
     KTrace("RtlTryEnterCriticalSection");
-    ctx.r3.u32 = CsFor(ctx.r3.u32).try_lock() ? 1 : 0;
+    CsEntry& cs = CsFor(ctx.r3.u32);
+    const bool got = cs.m.try_lock();
+    if (got)
+    {
+        cs.ownerLr.store((uint32_t)ctx.lr, std::memory_order_relaxed);
+        cs.ownerTid.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    }
+    ctx.r3.u32 = got ? 1 : 0;
 }
 PPC_FUNC(__imp__KeEnterCriticalRegion)
 {

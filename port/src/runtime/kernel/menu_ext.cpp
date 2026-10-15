@@ -1088,7 +1088,7 @@ PPC_FUNC(NativeExitGameWindow)
         std::fprintf(stderr, "[menu] exit confirmed - quitting\n");
         std::fflush(stderr);
         std::fflush(stdout);
-        TerminateProcess(GetCurrentProcess(), 0);
+        LogDrain(); TerminateProcess(GetCurrentProcess(), 0);
     }
 }
 

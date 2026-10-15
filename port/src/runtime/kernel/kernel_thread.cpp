@@ -28,10 +28,16 @@ std::mutex g_gtMutex;
 struct GuestThreadRec { unsigned long tid; uint32_t entry, ctxArg; };
 std::vector<GuestThreadRec> g_guestThreads;
 }
+void HitchRegisterThread(const char* name);   // diag_hooks.cpp (TTT2_HITCH_PROFILE=3)
 void KernelRegisterGuestThread(uint32_t entry, uint32_t ctxArg)
 {
-    std::lock_guard lk(g_gtMutex);
-    g_guestThreads.push_back({ GetCurrentThreadId(), entry, ctxArg });
+    {
+        std::lock_guard lk(g_gtMutex);
+        g_guestThreads.push_back({ GetCurrentThreadId(), entry, ctxArg });
+    }
+    char name[32];
+    std::snprintf(name, sizeof(name), "guest %08X", entry);
+    HitchRegisterThread(name);
 }
 void KernelDumpGuestThreads()
 {
@@ -182,6 +188,8 @@ void GuestCall4(uint32_t guestAddr, uint32_t a0, uint32_t a1, uint32_t a2, uint3
     if (fn) GuestInvoke(fn, ctx);
 }
 
+void GpuProgress();     // kernel_video.cpp: wakes waiters on GPU-side writes
+
 // --- DPC dispatch: KeInsertQueueDpc queues {routine, dpc, context, args} to a dedicated
 // dispatcher thread, mimicking deferred execution at "interrupt time". ---
 namespace {
@@ -203,6 +211,7 @@ void DpcThread()
             g_dpcQueue.pop_front();
         }
         GuestCall4(item.routine, item.dpc, item.context, item.arg1, item.arg2);
+        GpuProgress();          // the swap DPC writes the scratch tokens the GPU waits on
     }
 }
 } // namespace

@@ -629,6 +629,15 @@ void KernelSignalEventHandle(uint32_t handle)
     if (auto* event = dynamic_cast<KEvent*>(KernelGetObject(handle))) event->Set();
 }
 bool KernelIsEventHandle(uint32_t handle) { return dynamic_cast<KEvent*>(KernelGetObject(handle)) != nullptr; }
+// Is a thread waiting on event `handle` right now (queued single-object waiter, or a multi-wait
+// that includes it)? Not an event: true (callers then keep the game's own behaviour).
+bool KernelEventHasWaiters(uint32_t handle)
+{
+    auto* event = dynamic_cast<KEvent*>(KernelGetObject(handle));
+    if (!event) return true;
+    std::lock_guard lk(event->m);
+    return !event->queue.empty() || event->multiWaiters != nullptr;
+}
 
 PPC_FUNC(__imp__NtSetEvent)
 {

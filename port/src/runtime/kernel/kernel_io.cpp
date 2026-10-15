@@ -13,6 +13,7 @@
 #include <mutex>
 #include <memory>
 #include <filesystem>
+#include <chrono>
 #include <vector>
 #include <algorithm>
 
@@ -341,8 +342,24 @@ bool TryCloseGuestFile(uint32_t handle)
     return true;
 }
 
-PPC_FUNC(__imp__NtCreateFile) { KTrace("NtCreateFile"); DoOpen(ctx, base,true); }
-PPC_FUNC(__imp__NtOpenFile)   { KTrace("NtOpenFile");   DoOpen(ctx, base,false); }
+// TTT2_FRAMETIME=1: host file calls over 5 ms (the caller waits for them: reads are synchronous).
+// Per-thread totals of the host file calls (TTT2_FRAMETIME): diag_hooks.cpp reads them around slow tasks.
+struct ThreadIo { uint64_t calls = 0, bytes = 0; double ms = 0; };
+thread_local ThreadIo g_threadIo;
+void ThreadIoTotals(uint64_t& calls, uint64_t& bytes, double& ms) { calls = g_threadIo.calls; bytes = g_threadIo.bytes; ms = g_threadIo.ms; }
+static void LogSlowIo(const char* what, std::chrono::steady_clock::time_point start, uint32_t length)
+{
+    static const bool on = [] { const char* e = std::getenv("TTT2_FRAMETIME"); return e && *e == '1'; }();
+    if (!on) return;
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    g_threadIo.calls += 1;
+    g_threadIo.bytes += length;
+    g_threadIo.ms += ms;
+    static std::atomic<int> logged{ 0 };
+    if (ms > 5.0 && logged++ < 300) std::fprintf(stderr, "[frame] slow %s %.1f ms (%u bytes) thread %lu\n", what, ms, length, GetCurrentThreadId());
+}
+PPC_FUNC(__imp__NtCreateFile) { KTrace("NtCreateFile"); const auto t = std::chrono::steady_clock::now(); DoOpen(ctx, base,true); LogSlowIo("open", t, 0); }
+PPC_FUNC(__imp__NtOpenFile)   { KTrace("NtOpenFile");   const auto t = std::chrono::steady_clock::now(); DoOpen(ctx, base,false); LogSlowIo("open", t, 0); }
 
 PPC_FUNC(__imp__NtReadFile)
 {
@@ -364,6 +381,7 @@ PPC_FUNC(__imp__NtReadFile)
     }
     DWORD read = 0;
     uint32_t status = STATUS_SUCCESS;
+    const auto ioStart = std::chrono::steady_clock::now();
     {
         // The host handle is synchronous. Its shared file pointer needs one lock across
         // the entire seek/read sequence, including NtSet/QueryInformationFile calls.
@@ -399,6 +417,7 @@ PPC_FUNC(__imp__NtReadFile)
         }
         // A valid zero-length read succeeds without changing the file position.
     }
+    LogSlowIo("read", ioStart, length);
     {
         static std::atomic<uint64_t> dlog{0};
         uint64_t dn = ++dlog;

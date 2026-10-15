@@ -25,7 +25,7 @@ if not exist "%TTT2_VFS_ROOT%\data000.bin" (
     exit /b 1
 )
 if not defined TTT2_RUN_LOG goto launch
-if exist "%TTT2_RUN_LOG%\" (
+if exist "%TTT2_RUN_LOG%\*" (
     echo Log path is a directory: "%TTT2_RUN_LOG%"
     exit /b 1
 )

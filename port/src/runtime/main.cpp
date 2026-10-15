@@ -11,6 +11,8 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #include <timeapi.h>
+#include <fcntl.h>
+#include <io.h>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
@@ -136,7 +138,7 @@ static void StackDumpAfter(int seconds)
         std::fprintf(stderr, "\n");
     }
     std::fprintf(stderr, "[stacks] ==== end dump ====\n");
-    TerminateProcess(GetCurrentProcess(), 3);
+    LogDrain(); TerminateProcess(GetCurrentProcess(), 3);
 }
 
 // Called through the lookup table when guest code indirect-calls an address with no
@@ -158,7 +160,7 @@ static void UnmappedCallReporter(PPCContext& ctx, uint8_t* base)
         // this first divergence, rather than reporting a later corrupt pointer.
         std::fprintf(stderr, "[runtime] strict indirect-call gate failed; stopping before further guest execution\n");
         std::fflush(stderr);
-        TerminateProcess(GetCurrentProcess(), 5);
+        LogDrain(); TerminateProcess(GetCurrentProcess(), 5);
     }
 }
 PPCFunc* const g_unmappedReporter = UnmappedCallReporter;
@@ -331,6 +333,7 @@ static int FaultFilter(EXCEPTION_POINTERS* ep)
             }
         }
     }
+    LogDrain();
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
@@ -377,6 +380,62 @@ static std::string InstalledLayout(int argc)
     return narrow(image);
 }
 
+// The log goes through a pipe to a writer thread when stderr is a file (log.txt, or a
+// launcher's redirect): a guest or GPU thread that logs only copies into the pipe, and a slow
+// WriteFile (antivirus scan, busy disk) stalls only the writer - measured 2026-10-15: a 115 ms
+// boot frame with the command processor inside fprintf -> WriteFile. TTT2_LOG_ASYNC=0: write
+// directly, as before.
+static HANDLE g_logPipeRead = nullptr;
+static std::atomic<bool> g_logWriting{ false };
+
+static void StartLogWriter()
+{
+    if (const char* e = std::getenv("TTT2_LOG_ASYNC"); e && *e == '0') return;
+    const int fd = _fileno(stderr);
+    const HANDLE file = fd >= 0 ? reinterpret_cast<HANDLE>(_get_osfhandle(fd)) : INVALID_HANDLE_VALUE;
+    if (file == INVALID_HANDLE_VALUE || !file || GetFileType(file) != FILE_TYPE_DISK) return;
+    HANDLE target = nullptr, read = nullptr, write = nullptr;
+    if (!DuplicateHandle(GetCurrentProcess(), file, GetCurrentProcess(), &target, 0, FALSE, DUPLICATE_SAME_ACCESS)) return;
+    if (!CreatePipe(&read, &write, nullptr, 1 << 20)) { CloseHandle(target); return; }
+    const int pipeFd = _open_osfhandle(reinterpret_cast<intptr_t>(write), _O_WRONLY | _O_TEXT);
+    if (pipeFd < 0 || _dup2(pipeFd, fd) != 0)
+    {
+        if (pipeFd >= 0) _close(pipeFd); else CloseHandle(write);
+        CloseHandle(read);
+        CloseHandle(target);
+        return;
+    }
+    _close(pipeFd);                     // fd 2 keeps its own duplicate of the write end
+    SetStdHandle(STD_ERROR_HANDLE, reinterpret_cast<HANDLE>(_get_osfhandle(fd)));
+    g_logPipeRead = read;
+    std::thread([read, target] {
+        static char buffer[1 << 16];
+        for (;;)
+        {
+            DWORD n = 0;
+            if (!ReadFile(read, buffer, sizeof(buffer), &n, nullptr) || !n) return;
+            g_logWriting = true;
+            DWORD written = 0;
+            WriteFile(target, buffer, n, &written, nullptr);
+            g_logWriting = false;
+        }
+    }).detach();
+}
+
+void LogDrain(unsigned timeoutMs)
+{
+    if (!g_logPipeRead) return;
+    const ULONGLONG until = GetTickCount64() + timeoutMs;
+    int quiet = 0;                      // two empty checks in a row: the writer has caught up
+    while (quiet < 2 && GetTickCount64() < until)
+    {
+        DWORD queued = 0;
+        PeekNamedPipe(g_logPipeRead, nullptr, 0, nullptr, &queued, nullptr);
+        quiet = queued == 0 && !g_logWriting ? quiet + 1 : 0;
+        Sleep(quiet ? 5 : 1);
+    }
+}
+
 // Guest entry call isolated in its own frame (no C++ unwinding objects) for __try/__except.
 static void RunGuest(PPCContext& ctx, uint8_t* base)
 {
@@ -391,6 +450,7 @@ int main(int argc, char** argv)
     if (argc >= 2 && std::strcmp(argv[1], "--steam-bridge") == 0) return steamnet::RunBridge();
     const std::string installedImage = InstalledLayout(argc);
     std::setvbuf(stderr, nullptr, _IONBF, 0);   // unbuffered: trace survives a hard crash
+    StartLogWriter();
 
     // Timer resolution. Since Windows 10 2004 a process that never calls timeBeginPeriod
     // gets the default ~15.6 ms timer even if other processes asked for more, so every
@@ -426,7 +486,11 @@ int main(int argc, char** argv)
         auto* r = ep->ExceptionRecord;
         std::fprintf(stderr, "[fatal] unhandled exception %08lX at %p (tid %lu)\n",
                      r->ExceptionCode, r->ExceptionAddress, GetCurrentThreadId());
+        std::fprintf(stderr, "[fatal] module base %p, RVA %llX\n", GetModuleHandleW(nullptr),
+                     (unsigned long long)(reinterpret_cast<uint64_t>(r->ExceptionAddress) -
+                                          reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr))));
         std::fflush(stderr);
+        LogDrain();
         return EXCEPTION_EXECUTE_HANDLER;
     });
 

@@ -1754,7 +1754,11 @@ bool GpuExecuteDraw(const uint32_t* regs, uint32_t initiator, uint32_t indexAddr
     uint32_t depthBase = regs[0x2002] & 0xFFF;
     // A depth-only pass still has to run: it is how the game clears Z.
     bool colorPass = writeMask != 0;
-    if (!colorPass && !zWrite) return false;
+    // Stencil (RB_DEPTHCONTROL bit 0; ref / masks in RB_STENCILREFMASK): a stencil-only pass,
+    // with neither colour nor depth writes, still marks pixels for later passes.
+    const bool stencilEnable = (depthCtl & 1) != 0;
+    const bool stencilWrite = stencilEnable && ((regs[0x210D] >> 16) & 0xFF) != 0;
+    if (!colorPass && !zWrite && !stencilWrite) return false;
 
     uint32_t cull = regs[0x2205] & 3;            // PA_SU_SC_MODE_CNTL: 1 = front, 2 = back
     bool frontIsCW = ((regs[0x2205] >> 2) & 1) != 0;
@@ -2178,6 +2182,8 @@ bool GpuExecuteDraw(const uint32_t* regs, uint32_t initiator, uint32_t indexAddr
         st.colorBase = colorBase | (((regs[0x2001] >> 16) & 0xFu) << 12);   // base + format
         st.depthBase = depthBase; st.writeMask = writeMask;
         st.zEnable = zEnable; st.zWrite = zWrite; st.zFunc = zFunc;
+        st.stencil = stencilEnable; st.depthCtl = depthCtl;
+        st.stencilRefMask = regs[0x210D]; st.stencilRefMaskBf = regs[0x210C];
         st.blend = blend;
         for (int i = 0; i < 4; ++i) st.blendConst[i] = constRGB[i];
         st.scX0 = scX0; st.scY0 = scY0; st.scX1 = scX1; st.scY1 = scY1;
@@ -2557,8 +2563,39 @@ bool GpuHwDumpResolved(uint32_t destBase, const char* path)
 void GpuHwWriteBackRange(uint32_t start, uint32_t size)
 {
 #if defined(TTT2_GPU_HW_BACKEND)
-    if (GpuHwMode())
-        ttt2_hw::Guarded("writeback", [&] { ttt2_hw::Get().WriteBackRange(start, size); });
+    // The backend answers "still copying" instead of waiting under its lock; wait with the lock
+    // released - on the GPU fence signalled after the copy (it wakes exactly when the copy is done;
+    // polling woke ~2 ms late on average, MEASURED 2026-10-15: fight-intro bake reads 7.7 -> 5.6 ms
+    // median), or without one by polling (yield first, then 1 ms sleeps) - and after 2000 rounds let
+    // Map wait.
+    static const bool timing = [] { const char* e = std::getenv("TTT2_FRAMETIME"); return e && *e == '1'; }();
+    const auto t0 = std::chrono::steady_clock::now();
+    unsigned polls = 0;
+    for (bool pending = GpuHwMode(); pending;)
+    {
+        const bool block = polls > 2000;
+        Microsoft::WRL::ComPtr<ID3D11Fence> fence;
+        uint64_t fenceValue = 0;
+        if (!ttt2_hw::Guarded("writeback", [&] {
+                pending = ttt2_hw::Get().WriteBackRange(start, size, block);
+                if (pending) fence = ttt2_hw::Get().PendingFence(fenceValue);
+            })) break;
+        if (!pending) break;
+        ++polls;
+        // Wait for exactly the copy (the GPU signals the fence after it); otherwise poll: yield
+        // first, then 1 ms sleeps.
+        static thread_local HANDLE copied = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (fence && copied && SUCCEEDED(fence->SetEventOnCompletion(fenceValue, copied))) WaitForSingleObject(copied, 100);
+        else if (polls < 64) SwitchToThread();
+        else Sleep(1);
+    }
+    if (timing)
+    {
+        const double total = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        static std::atomic<int> logged{ 0 };
+        if (total > 1.0 && logged++ < 200)
+            std::fprintf(stderr, "[frame] cpu-read fault %08X: %.2f ms (%u polls) thread %lu\n", start, total, polls, GetCurrentThreadId());
+    }
 #else
     (void)start; (void)size;
 #endif

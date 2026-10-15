@@ -527,9 +527,46 @@ void XLivePollInvites()
 // an overlapped request completes inline and reports pending, failures as ERROR_FUNCTION_FAILED
 // with the HRESULT as extended error (real XAM; Xenia's fork loses it). Session searches can wait
 // on Steam's lobby list for seconds: those complete from a worker thread instead.
+// XMP (app 0xFA, the music player / custom soundtracks), offline: no media sources. TEKKEN TUNES
+// asks XMPGetMediaSources (0x0007002B) on the way in; failing it left the screen black ~27 s
+// (the user's run, 2026-10-15) before the page appeared. Arguments as Xenia's XmpApp:
+// {client, connected-only, MSAL_MEDIASOURCEINFO* (0xB4 each), max, &returned}; a null array
+// asks for the count (10 slots), the answer is 0 sources.
+static uint32_t XmpDispatch(uint8_t* base, uint32_t msg, uint32_t buffer, bool& handled)
+{
+    handled = false;
+    if (msg != 0x0007002B || !buffer) return E_FAIL_;
+    handled = true;
+    constexpr uint32_t kSlots = 10;
+    const uint32_t sources = GRead32(base, buffer + 8), max = GRead32(base, buffer + 12), returned = GRead32(base, buffer + 16);
+    if (!returned) return E_INVALIDARG_;
+    if (!sources) { GWrite32(base, returned, kSlots); return 0; }
+    if (max < kSlots) return 0x80070008u;                     // E_OUTOFMEMORY-style: buffer too small
+    for (uint32_t i = 0; i < kSlots; ++i)
+    {
+        std::memset(base + sources + i * 0xB4, 0, 0x28);
+        GWrite32(base, sources + i * 0xB4, i);
+    }
+    GWrite32(base, returned, 0);
+    return 0;
+}
+
 static void StartIORequest(PPCContext& ctx, uint8_t* base, const char* name)
 {
     const uint32_t app = ctx.r3.u32, msg = ctx.r4.u32, overlapped = ctx.r5.u32, buffer = ctx.r6.u32, length = ctx.r7.u32;
+    if (app == 0xFA)
+    {
+        bool handled = false;
+        const uint32_t hr = XmpDispatch(base, msg, buffer, handled);
+        if (handled)
+        {
+            std::fprintf(stderr, "[xmp] %s(msg %08X) -> %08X (no media sources)\n", name, msg, hr);
+            if (!overlapped) { ctx.r3.u64 = hr; return; }
+            if (const uint32_t e = XamValidateOverlapped(base, overlapped)) { ctx.r3.u64 = e; return; }
+            ctx.r3.u64 = XamCompleteOverlapped(base, overlapped, hr ? ERROR_FUNCTION_FAILED_ : 0, 0, hr);
+            return;
+        }
+    }
     const bool search = app == 0xFB && (msg == 0x000B0016 || msg == 0x000B001C || msg == 0x000B001B);
     if (search && overlapped && xlive::Enabled() && !XamValidateOverlapped(base, overlapped) && buffer && length &&
         length <= 0x100 && XamGuestRange(buffer, length, 1))

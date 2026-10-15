@@ -626,21 +626,28 @@ static void PollInjectFile(PadScript& s, uint64_t now)
     const char* path = injectPath.c_str();
     FILE* f = std::fopen(path, "r");
     if (!f) return;
+    std::erase_if(s.presses, [now](const ScriptedPress& p) { return p.until < now; });
     char line[128];
-    uint64_t at = (std::max)(now, s.injectBusyUntil);
+    uint64_t at = (std::max)(now, s.injectBusyUntil), previous = at;
+    static int logged = 0;
     while (std::fgets(line, sizeof(line), f))
     {
         char names[96] = {};
         unsigned hold = 150, gap = 250;
         if (std::sscanf(line, "%95s %u %u", names, &hold, &gap) < 1) continue;
+        // "&BUTTONS ..." starts together with the line before (both players at once).
+        const bool together = names[0] == '&';
         int player = 0;
-        const uint16_t b = ParseButtons(names, &player);
+        const uint16_t b = ParseButtons(names + together, &player);
         if (!b) continue;
-        s.presses.push_back({ at, at + hold, b, player });
+        const uint64_t start = together ? previous : at;
+        s.presses.push_back({ start, start + hold, b, player });
         s.player2 |= player == 1;
-        std::fprintf(stderr, "[input] inject %s at +%llums hold %u\n", names,
-                     (unsigned long long)(at - now), hold);
-        at += uint64_t(hold) + gap;
+        if (logged < 2000 && ++logged)
+            std::fprintf(stderr, "[input] inject %s at +%llums hold %u\n", names,
+                         (unsigned long long)(start - now), hold);
+        previous = start;
+        at = (std::max)(at, start + hold + gap);
     }
     std::fclose(f);
     std::remove(path);

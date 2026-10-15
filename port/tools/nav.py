@@ -46,6 +46,8 @@ def main():
         os.replace(tmp, inject)
     before = frame.stat().st_mtime if frame.exists() else 0
     time.sleep(total_ms / 1000 + args.wait)
+    before = max(before, frame.stat().st_mtime if frame.exists() else 0)
+    frame.with_suffix(".request").touch()   # games run with TTT2_FBDUMP=request dump on demand
     deadline = time.time() + 5
     while frame.exists() and frame.stat().st_mtime <= before and time.time() < deadline:
         time.sleep(0.1)

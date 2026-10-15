@@ -24,6 +24,10 @@ extern PPCFunc* const g_unmappedReporter;
 // True when env TTT2_WTRACE is set: wait/sleep primitives log their guest caller (lr).
 bool WTrace();
 
+// The log (stderr) is written to its file by a background thread (main.cpp StartLogWriter).
+// Before the process ends abruptly (TerminateProcess, crash report), wait for what is queued.
+void LogDrain(unsigned timeoutMs = 300);
+
 // Report a guest fault (main.cpp). Returns EXCEPTION_EXECUTE_HANDLER.
 struct _EXCEPTION_POINTERS;
 int GuestFaultReport(_EXCEPTION_POINTERS* ep);

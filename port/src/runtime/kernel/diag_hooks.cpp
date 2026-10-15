@@ -17,6 +17,11 @@
 #include <cstring>
 #include <string>
 #include <chrono>
+#include <map>
+#include <set>
+#include <thread>
+#include <tuple>
+#include <vector>
 
 extern "C" PPC_FUNC(__imp__sub_82AD8A00);
 extern "C" PPC_FUNC(__imp__sub_82BD3DF0);
@@ -320,7 +325,8 @@ PPC_FUNC(sub_824F58B8)
 
 // Frame timeline (TTT2_TIMELINE=1, timeline.h): the game-side waits of a frame.
 // sub_82ACFF90(obj): main thread, polls obj+8 (busy) with 1 ms waits on the event at obj+196.
-// sub_82AE4438(monitor, target): job worker, waits until the monitor's 64-bit count = target.
+// sub_82AE4438(monitor, target): job worker, waits until the monitor's 64-bit count = target
+// (marked in its replacement, guest_monitor.cpp).
 // sub_82738DA0: D3D's wait for the GPU (loops on sub_8273D4A0).
 extern "C" PPC_FUNC(__imp__sub_82ACFF90);
 PPC_FUNC(sub_82ACFF90)
@@ -328,15 +334,485 @@ PPC_FUNC(sub_82ACFF90)
     const timeline::Scope mark{ timeline::MainResourceWait, ctx.r3.u32 };
     __imp__sub_82ACFF90(ctx, base);
 }
-extern "C" PPC_FUNC(__imp__sub_82AE4438);
-PPC_FUNC(sub_82AE4438)
-{
-    const timeline::Scope mark{ timeline::WorkerCounterWait, ctx.r4.u32 };
-    __imp__sub_82AE4438(ctx, base);
-}
 extern "C" PPC_FUNC(__imp__sub_82738DA0);
 PPC_FUNC(sub_82738DA0)
 {
     const timeline::Scope mark{ timeline::MainGpuWait, ctx.r4.u32 };
     __imp__sub_82738DA0(ctx, base);
 }
+
+// TTT2_FRAMETIME=1: guest functions on the main thread's stack during the ~100 ms fight hitch
+// (profile 2026-10-14) - each call over 8 ms is logged with its thread.
+static void TimeCall(const char* name, PPCContext& ctx, uint8_t* base, void (*fn)(PPCContext&, uint8_t*))
+{
+    static const bool on = [] { const char* e = std::getenv("TTT2_FRAMETIME"); return e && *e == '1'; }();
+    if (!on) { fn(ctx, base); return; }
+    const auto start = std::chrono::steady_clock::now();
+    fn(ctx, base);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    static std::atomic<int> logged{ 0 };
+    if (ms > 8.0 && logged++ < 400) std::fprintf(stderr, "[frame] slow call %s %.1f ms thread %lu\n", name, ms, GetCurrentThreadId());
+}
+#define TIMED_HOOK(addr) \
+    extern "C" PPC_FUNC(__imp__sub_##addr); \
+    PPC_FUNC(sub_##addr) { TimeCall("sub_" #addr, ctx, base, __imp__sub_##addr); }
+TIMED_HOOK(82AD8F28)
+TIMED_HOOK(82AFB798)
+TIMED_HOOK(82B0BD68)
+TIMED_HOOK(82C12250)
+// TTT2_HITCH_PROFILE: an in-process sampler (profile_threads.py manages ~65 Hz from outside, too
+// coarse for one 100 ms frame). A sampler thread suspends a thread, records its guest call chain
+// (ctx.lr, then the r1 backchain: saved LR at [backchain - 8]) and its host stack (function starts
+// via RtlVirtualUnwind; exe ones print as RVAs for port/tools/rva2sym.py, others as module+RVA).
+//   1: the main thread every 0.5 ms while it runs a game task (sub_82A80AD8, hook below); a task
+//      over 20 ms prints its profile.
+//   2: also the main thread all the time (1 kHz), a profile per 10 s: where frame time goes.
+//   3: flight recorder - the main and command-processor threads all the time (1 kHz), and for
+//      every presented frame over 25 ms (HitchFrameGap) both threads' profiles over that gap.
+//   4: the main and command-processor threads all the time (1 kHz), a profile of each per 10 s.
+namespace hitch {
+struct Sample { int64_t at; uint32_t chain[24]; uint32_t depth; uint64_t host[32]; uint32_t hostDepth; };
+struct Target
+{
+    std::string name;
+    DWORD tid = 0;
+    HANDLE thread = nullptr;
+    ULONG_PTR stackLow = 0, stackHigh = 0;
+    PPCContext* ctx = nullptr;
+    std::vector<Sample> ring;                     // flight recorder (mode 3), sampler thread only
+    size_t next = 0;
+    std::vector<Sample> window;                   // modes 2 and 4, sampler thread only
+};
+std::atomic<bool> g_active{ false }, g_busy{ false };
+std::mutex g_targetsMutex, g_samplesMutex;
+std::vector<Target*> g_targets;                   // [0] = main thread once known
+std::atomic<Target*> g_main{ nullptr };
+std::vector<Sample> g_samples;   // guest memory: the runtime's ::g_base (set before any thread)
+struct Gap { int64_t end; double ms; };
+std::mutex g_gapsMutex;
+std::vector<Gap> g_gaps;
+std::atomic<int> g_gapReports{ 0 };
+
+int Mode()
+{
+    static const int mode = [] {
+        const char* e = std::getenv("TTT2_HITCH_PROFILE");
+        return e && *e >= '1' && *e <= '4' ? *e - '0' : 0;
+    }();
+    return mode;
+}
+bool On() { return Mode() != 0; }
+void Report(const char* header, const std::vector<Sample>& samples, size_t guestTop = 40, size_t hostTop = 40, size_t leafTop = 20);
+void Loop();
+
+int64_t Now()
+{
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return t.QuadPart;
+}
+int64_t Freq()
+{
+    static const int64_t f = [] { LARGE_INTEGER q; QueryPerformanceFrequency(&q); return q.QuadPart; }();
+    return f;
+}
+
+// Called on the thread to be sampled.
+Target* Register(const char* name, PPCContext* ctx, bool main = false)
+{
+    auto* t = new Target;
+    t->name = name;
+    t->tid = GetCurrentThreadId();
+    t->ctx = ctx;
+    GetCurrentThreadStackLimits(&t->stackLow, &t->stackHigh);
+    t->thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, GetCurrentThreadId());
+    if (Mode() == 3) t->ring.resize(1024);
+    static std::once_flag started;
+    std::call_once(started, [] { std::thread(Loop).detach(); });
+    if (main) g_main = t;
+    std::lock_guard l(g_targetsMutex);
+    g_targets.push_back(t);
+    return t;
+}
+
+uint32_t FunctionOf(uint32_t address)
+{
+    static const size_t count = [] { size_t n = 0; while (PPCFuncMappings[n].guest) ++n; return n; }();
+    size_t lo = 0, hi = count;
+    while (lo < hi)
+    {
+        const size_t mid = (lo + hi) / 2;
+        if (PPCFuncMappings[mid].guest <= address) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo ? PPCFuncMappings[lo - 1].guest : 0;
+}
+
+// kernel_thread.cpp's registry: host thread -> the PPCContext of its current guest call.
+struct GuestContextSlot { uint32_t tid; uint32_t entry; PPCContext* ctx; };
+extern "C" struct GuestContextRegistry
+{
+    uint32_t magic, version, r1Offset, lrOffset, capacity;
+    std::atomic<uint32_t> count;
+    GuestContextSlot slots[512];
+} g_guestContextRegistry;
+
+PPCContext* GuestContextOf(DWORD tid)
+{
+    const uint32_t n = (std::min)(g_guestContextRegistry.count.load(), 512u);
+    for (uint32_t i = 0; i < n; ++i)
+        if (g_guestContextRegistry.slots[i].tid == tid) return g_guestContextRegistry.slots[i].ctx;
+    return nullptr;
+}
+
+// The walks run while the thread is suspended; a fault (an odd host frame, a stale guest
+// context) loses the sample instead of the process.
+bool Walk(Target& t, Sample& s);
+bool Take(Target& t, Sample& s)
+{
+    if (SuspendThread(t.thread) == DWORD(-1)) return false;
+    s = {};
+    s.at = Now();
+    const bool ok = Walk(t, s);
+    ResumeThread(t.thread);
+    return ok;
+}
+
+bool Walk(Target& t, Sample& s)
+{
+    __try
+    {
+    CONTEXT hc{};
+    hc.ContextFlags = CONTEXT_FULL;
+    if (GetThreadContext(t.thread, &hc))
+    {
+        // Leaf functions without unwind data return through [rsp].
+        for (; s.hostDepth < 32 && hc.Rip && hc.Rsp >= t.stackLow && hc.Rsp + 8 <= t.stackHigh; )
+        {
+            DWORD64 image = 0;
+            PRUNTIME_FUNCTION fn = RtlLookupFunctionEntry(hc.Rip, &image, nullptr);
+            s.host[s.hostDepth++] = fn ? image + fn->BeginAddress : hc.Rip;
+            if (!fn)
+            {
+                hc.Rip = *reinterpret_cast<DWORD64*>(hc.Rsp);
+                hc.Rsp += 8;
+                continue;
+            }
+            void* handlerData = nullptr;
+            DWORD64 establisher = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, hc.Rip, fn, &hc, &handlerData, &establisher, nullptr);
+        }
+    }
+    if (PPCContext* c = t.ctx ? t.ctx : GuestContextOf(t.tid))
+    {
+        s.chain[s.depth++] = uint32_t(c->lr);
+        uint32_t frame = c->r1.u32;
+        for (int i = 0; i < 23 && frame && frame < 0xFFFFFFF0u; ++i)
+        {
+            const uint32_t prev = GRead32(g_base, frame);
+            if (!prev || prev <= frame || prev - frame > 0x10000) break;
+            s.chain[s.depth++] = GRead32(g_base, prev - 8);
+            frame = prev;
+        }
+    }
+    return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// A sample whose innermost host frame is a kernel wait / delay / yield stub (ntdll Nt* syscall
+// stubs are short functions that end in syscall; NtWaitForSingleObject, NtDelayExecution,
+// NtYieldExecution, NtSignalAndWaitForSingleObject, NtWaitForMultipleObjects, NtWaitForAlertByThreadId).
+bool Waiting(uint64_t leaf)
+{
+    static const std::vector<uint64_t> stubs = [] {
+        std::vector<uint64_t> v;
+        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        for (const char* n : { "NtWaitForSingleObject", "NtDelayExecution", "NtYieldExecution", "NtSignalAndWaitForSingleObject",
+                               "NtWaitForMultipleObjects", "NtWaitForAlertByThreadId", "NtRemoveIoCompletion", "ZwWaitForWorkViaWorkerFactory" })
+            if (FARPROC f = GetProcAddress(ntdll, n)) v.push_back(reinterpret_cast<uint64_t>(f));
+        return v;
+    }();
+    for (uint64_t a : stubs)
+        if (leaf >= a && leaf < a + 0x20) return true;
+    return false;
+}
+
+void ReportGaps()
+{
+    std::vector<Gap> gaps;
+    {
+        std::lock_guard l(g_gapsMutex);
+        gaps.swap(g_gaps);
+    }
+    std::vector<Target*> targets;
+    {
+        std::lock_guard l(g_targetsMutex);
+        targets = g_targets;
+    }
+    for (const Gap& gap : gaps)
+    {
+        if (g_gapReports++ >= 300) return;
+        const int64_t start = gap.end - int64_t(gap.ms * Freq() / 1000.0);
+        for (Target* t : targets)
+        {
+            std::vector<Sample> in;
+            uint32_t busy = 0;
+            for (const Sample& s : t->ring)
+                if (s.at >= start && s.at <= gap.end)
+                {
+                    in.push_back(s);
+                    busy += s.hostDepth && !Waiting(s.host[0]);
+                }
+            // Other threads only when they ran for a fifth of the gap (not parked in a wait).
+            if (in.empty() || (t != g_main.load() && t->name != "cp" && busy * 5 < in.size())) continue;
+            char header[96];
+            std::snprintf(header, sizeof(header), "[gap] %.1f ms frame: %s thread (busy %u%%)", gap.ms, t->name.c_str(),
+                          in.empty() ? 0u : unsigned(100.0 * busy / in.size() + 0.5));
+            Report(header, in, 14, 16, 8);
+        }
+    }
+}
+
+void Loop()
+{
+    const int mode = Mode();
+    const bool always = mode >= 2;
+    const int64_t step = Freq() / (always ? 1000 : 2000);   // 1 / 0.5 ms
+    int64_t windowStart = Now();
+    for (;;)
+    {
+        if (!always && !g_active.load(std::memory_order_acquire)) { Sleep(1); continue; }
+        std::vector<Target*> targets;
+        {
+            std::lock_guard l(g_targetsMutex);
+            targets = g_targets;
+        }
+        for (Target* t : targets)
+        {
+            const bool main = t == g_main;
+            if (!main && mode != 3 && !(mode == 4 && t->name == "cp")) continue;
+            g_busy = main;
+            const bool task = main && g_active.load(std::memory_order_acquire);
+            Sample s;
+            if ((task || always) && Take(*t, s))
+            {
+                if (mode == 3) { t->ring[t->next] = s; t->next = (t->next + 1) % t->ring.size(); }
+                if ((mode == 2 && main) || mode == 4) t->window.push_back(s);
+                std::lock_guard l(g_samplesMutex);
+                if (task && g_samples.size() < 20000) g_samples.push_back(s);
+            }
+            g_busy = false;
+        }
+        const int64_t now = Now();
+        if ((mode == 2 || mode == 4) && now - windowStart >= Freq() * 10)
+        {
+            for (Target* t : targets)
+            {
+                if (t->window.empty()) continue;
+                const std::string header = "[profile] " + t->name + " thread, last 10 s";
+                Report(header.c_str(), t->window, 40, 60, 30);
+                t->window.clear();
+            }
+            windowStart = now;
+        }
+        if (mode == 3) ReportGaps();
+        while (Now() < now + step) YieldProcessor();
+    }
+}
+
+void Begin(PPCContext& ctx, uint8_t* base)
+{
+    if (!On()) return;
+    (void)base;
+    if (!g_main) Register("main", &ctx, true);
+    {
+        std::lock_guard l(g_samplesMutex);
+        g_samples.clear();
+    }
+    g_active.store(true, std::memory_order_release);
+}
+
+void End(double ms, uint32_t vtable)
+{
+    if (!On()) return;
+    g_active.store(false, std::memory_order_release);
+    while (g_busy.load()) YieldProcessor();
+    if (ms < 20.0) return;
+    std::vector<Sample> samples;
+    {
+        std::lock_guard l(g_samplesMutex);
+        samples.swap(g_samples);
+    }
+    char header[96];
+    std::snprintf(header, sizeof(header), "[hitch] task vtable %08X %.1f ms", vtable, ms);
+    Report(header, samples);
+}
+
+void Report(const char* header, const std::vector<Sample>& samples, size_t guestTop, size_t hostTop, size_t leafTop)
+{
+    std::fprintf(stderr, "%s, %zu samples\n", header, samples.size());
+    if (samples.empty()) return;
+    std::map<uint32_t, uint32_t> inclusive, innermost;
+    std::map<uint64_t, uint32_t> hostInclusive, hostLeaf;
+    for (const Sample& s : samples)
+    {
+        std::set<uint32_t> seen;
+        for (uint32_t i = 0; i < s.depth; ++i)
+        {
+            const uint32_t f = FunctionOf(s.chain[i]);
+            if (f && seen.insert(f).second) ++inclusive[f];
+        }
+        if (s.depth) ++innermost[FunctionOf(s.chain[0])];
+        std::set<uint64_t> seenHost;
+        for (uint32_t i = 0; i < s.hostDepth; ++i)
+            if (seenHost.insert(s.host[i]).second) ++hostInclusive[s.host[i]];
+        if (s.hostDepth) ++hostLeaf[s.host[0]];
+    }
+    auto top = [](const auto& m, size_t n) {
+        std::vector<std::pair<uint32_t, typename std::decay_t<decltype(m)>::key_type>> v;
+        for (const auto& [k, c] : m) v.push_back({ c, k });
+        std::sort(v.rbegin(), v.rend());
+        if (v.size() > n) v.resize(n);
+        return v;
+    };
+    auto pct = [&](uint32_t c) { return std::to_string(unsigned(100.0 * c / samples.size() + 0.5)) + "%"; };
+    for (const auto& [label, m, n] : { std::tuple{ "inclusive", &inclusive, guestTop }, std::tuple{ "innermost", &innermost, guestTop / 2 } })
+    {
+        if (m->empty()) continue;
+        std::string out = std::string("[hitch]   ") + label + ":";
+        for (const auto& [c, f] : top(*m, n))
+        {
+            char b[16];
+            std::snprintf(b, sizeof(b), " %08X=", f);
+            out += b + pct(c);
+        }
+        std::fprintf(stderr, "%s\n", out.c_str());
+    }
+    // exe functions as RVAs (rva2sym.py), others as module+RVA.
+    auto where = [](uint64_t address) {
+        HMODULE m = nullptr;
+        char path[MAX_PATH] = "?";
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCSTR>(address), &m) && m)
+            GetModuleFileNameA(m, path, sizeof(path));
+        const char* name = std::strrchr(path, '\\');
+        name = name ? name + 1 : path;
+        char b[96];
+        if (m == GetModuleHandleW(nullptr)) std::snprintf(b, sizeof(b), "%llX", (unsigned long long)(address - uint64_t(m)));
+        else std::snprintf(b, sizeof(b), "%s+%llX", name, (unsigned long long)(address - uint64_t(m)));
+        return std::string(b);
+    };
+    for (const auto& [label, m, n] : { std::tuple{ "host inclusive", &hostInclusive, hostTop }, std::tuple{ "host leaf", &hostLeaf, leafTop } })
+    {
+        std::string out = std::string("[hitch]   ") + label + ":";
+        for (const auto& [c, a] : top(*m, n)) out += " " + where(a) + "=" + pct(c);
+        std::fprintf(stderr, "%s\n", out.c_str());
+    }
+}
+} // namespace hitch
+
+// Mode 3 hooks for kernel_video.cpp: the command-processor thread registers itself, and the
+// present timer reports frames over 25 ms.
+void HitchRegisterThread(const char* name)
+{
+    if (hitch::Mode() == 3 || (hitch::Mode() == 4 && std::strcmp(name, "cp") == 0)) hitch::Register(name, nullptr);
+}
+void HitchFrameGap(double ms)
+{
+    if (hitch::Mode() != 3) return;
+    std::lock_guard l(hitch::g_gapsMutex);
+    hitch::g_gaps.push_back({ hitch::Now(), ms });
+}
+
+// TTT2_HITCH_PROFILE: the guest heap's RtlAllocateHeap (82BFA928: r3 heap, r4 flags, r5 size)
+// and RtlFreeHeap (82BFB220) counted and timed per thread, reported with each slow task: many
+// cheap calls (allocation-heavy code) or a few slow ones (long free-list walks)?
+namespace heapstat {
+struct Counts { uint64_t allocs = 0, frees = 0; double allocMs = 0, freeMs = 0, slowest = 0; uint32_t slowestSize = 0; };
+thread_local Counts t_counts;
+inline double Ms(LARGE_INTEGER a, LARGE_INTEGER b)
+{
+    static const double f = [] { LARGE_INTEGER q; QueryPerformanceFrequency(&q); return 1000.0 / double(q.QuadPart); }();
+    return double(b.QuadPart - a.QuadPart) * f;
+}
+}
+extern "C" PPC_FUNC(__imp__sub_82BFA928);
+PPC_FUNC(sub_82BFA928)
+{
+    if (!hitch::On()) { __imp__sub_82BFA928(ctx, base); return; }
+    const uint32_t size = ctx.r5.u32;
+    LARGE_INTEGER a, b;
+    QueryPerformanceCounter(&a);
+    __imp__sub_82BFA928(ctx, base);
+    QueryPerformanceCounter(&b);
+    auto& c = heapstat::t_counts;
+    const double ms = heapstat::Ms(a, b);
+    ++c.allocs;
+    c.allocMs += ms;
+    if (ms > c.slowest) { c.slowest = ms; c.slowestSize = size; }
+}
+extern "C" PPC_FUNC(__imp__sub_82BFB220);
+PPC_FUNC(sub_82BFB220)
+{
+    if (!hitch::On()) { __imp__sub_82BFB220(ctx, base); return; }
+    LARGE_INTEGER a, b;
+    QueryPerformanceCounter(&a);
+    __imp__sub_82BFB220(ctx, base);
+    QueryPerformanceCounter(&b);
+    auto& c = heapstat::t_counts;
+    const double ms = heapstat::Ms(a, b);
+    ++c.frees;
+    c.freeMs += ms;
+    if (ms > c.slowest) { c.slowest = ms; c.slowestSize = 0; }
+}
+
+void ThreadIoTotals(uint64_t& calls, uint64_t& bytes, double& ms);   // kernel_io.cpp
+void CtabCacheCounts(uint64_t& calls, uint64_t& hits);              // d3dx_ctab_cache.cpp
+// The game's task runner (task->vtable[1] = step, called until it stops): name the task.
+extern "C" PPC_FUNC(__imp__sub_82A80AD8);
+PPC_FUNC(sub_82A80AD8)
+{
+    static const bool on = [] { const char* e = std::getenv("TTT2_FRAMETIME"); return e && *e == '1'; }();
+    if (!on && !hitch::On()) { __imp__sub_82A80AD8(ctx, base); return; }       // no diagnostics: nothing added
+    const uint32_t task = ctx.r3.u32, vtable = task ? GRead32(base, task) : 0, step = vtable ? GRead32(base, vtable + 4) : 0;
+    const uint32_t lr = uint32_t(ctx.lr);
+    uint64_t calls0 = 0, bytes0 = 0, calls1 = 0, bytes1 = 0;
+    double io0 = 0, io1 = 0;
+    ThreadIoTotals(calls0, bytes0, io0);
+    static const DWORD mainThread = GetCurrentThreadId();
+    thread_local int depth = 0;
+    const bool outer = GetCurrentThreadId() == mainThread && depth++ == 0;
+    if (outer) hitch::Begin(ctx, base);
+    const heapstat::Counts heap0 = heapstat::t_counts;
+    uint64_t ctabCalls0 = 0, ctabHits0 = 0;
+    CtabCacheCounts(ctabCalls0, ctabHits0);
+    const auto start = std::chrono::steady_clock::now();
+    __imp__sub_82A80AD8(ctx, base);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    if (GetCurrentThreadId() == mainThread) --depth;
+    if (outer) hitch::End(ms, vtable);
+    if (outer && ms >= 20.0 && hitch::On())
+    {
+        const heapstat::Counts& h = heapstat::t_counts;
+        std::fprintf(stderr, "[hitch]   heap: %llu allocs %.1f ms, %llu frees %.1f ms (thread's slowest call so far %.2f ms, size %u)\n",
+                     (unsigned long long)(h.allocs - heap0.allocs), h.allocMs - heap0.allocMs,
+                     (unsigned long long)(h.frees - heap0.frees), h.freeMs - heap0.freeMs, h.slowest, h.slowestSize);
+        uint64_t ctabCalls = 0, ctabHits = 0;
+        CtabCacheCounts(ctabCalls, ctabHits);
+        std::fprintf(stderr, "[hitch]   constant tables: %llu requests, %llu from the cache\n",
+                     (unsigned long long)(ctabCalls - ctabCalls0), (unsigned long long)(ctabHits - ctabHits0));
+    }
+    if (!on) return;
+    ThreadIoTotals(calls1, bytes1, io1);
+    static std::atomic<int> logged{ 0 };
+    if (ms > 8.0 && logged++ < 400)
+        std::fprintf(stderr, "[frame]   file calls during it: %llu, %llu KB, %.1f ms\n", (unsigned long long)(calls1 - calls0),
+                     (unsigned long long)((bytes1 - bytes0) / 1024), io1 - io0);
+    if (ms > 8.0 && logged < 400)
+        std::fprintf(stderr, "[frame] slow task %08X vtable %08X step %08X %.1f ms (lr %08X) thread %lu\n", task, vtable, step, ms, lr,
+                     GetCurrentThreadId());
+}
+TIMED_HOOK(82258D60)
+TIMED_HOOK(825DEBD0)
+TIMED_HOOK(822D36C8)

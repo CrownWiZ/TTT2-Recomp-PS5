@@ -19,10 +19,13 @@
 #include "gpu_hw_translate.h"
 #include "display_settings.h"
 #include <d3d11_1.h>
+#include <d3d11_4.h>
 #include <dxgi1_2.h>
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 #include <array>
+#include <condition_variable>
+#include <deque>
 #include <cmath>
 #include <limits>
 #include <chrono>
@@ -34,6 +37,9 @@
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
+
+extern void (*g_gpuFrameNote)(const char*);   // gpu_render.cpp: the frame log (framelog.trigger)
 
 namespace ttt2_hw {
 using Microsoft::WRL::ComPtr;
@@ -41,8 +47,22 @@ using Microsoft::WRL::ComPtr;
 enum class Mode { Off = 0, On = 1, Compare = 2 };
 
 struct Failure : std::runtime_error { using std::runtime_error::runtime_error; };
+// TTT2_D3D_CALLS=1 (diagnostics): every checked D3D call counted by its label, printed with the
+// 5-second stats (which creations / maps a frame makes).
+inline bool CallCountOn()
+{
+    static const bool on = [] { const char* e = std::getenv("TTT2_D3D_CALLS"); return e && *e == '1'; }();
+    return on;
+}
+inline std::mutex g_callCountMutex;
+inline std::map<std::string, uint64_t> g_callCounts;
 inline void Check(HRESULT hr, const char* what)
 {
+    if (CallCountOn())
+    {
+        std::lock_guard l(g_callCountMutex);
+        ++g_callCounts[what];
+    }
     if (FAILED(hr))
     {
         char text[160];
@@ -153,6 +173,10 @@ struct DrawState
     uint32_t cull = 0;            // PA_SU_SC_MODE_CNTL bits 0/1: cull front/back
     bool frontIsCW = false;       // bit 2: clockwise (on screen) is the front face
     bool depthClip = false;       // PA_CL_CLIP_CNTL clipping enabled: clip 0 <= z <= w like Xenos
+    // Stencil: RB_DEPTHCONTROL (0x2200) bit 0 enable, bit 7 separate back-face state, funcs and
+    // ops in bits 8-31; RB_STENCILREFMASK (0x210D) and _BF (0x210C): ref, read mask, write mask.
+    bool stencil = false;
+    uint32_t depthCtl = 0, stencilRefMask = 0, stencilRefMaskBf = 0;
 };
 
 // The logical EDRAM surface space in samples (the vertex transform's frame): wide enough for
@@ -222,6 +246,12 @@ public:
         WideCharToMultiByte(CP_UTF8, 0, adesc.Description, -1, name, sizeof(name) - 1, nullptr, nullptr);
         std::fprintf(stderr, "[gpu-hw] active on %s (feature level %X), mode=%s\n", name, (unsigned)actual,
                      RequestedMode() == Mode::Compare ? "compare" : "on");
+        ComPtr<ID3D11Device5> device5;
+        const char* fenceEnv = std::getenv("TTT2_READBACK_FENCE");
+        if (!(fenceEnv && *fenceEnv == '0') && SUCCEEDED(device_.As(&device5)) && SUCCEEDED(context_.As(&context4_)) &&
+            SUCCEEDED(device5->CreateFence(0, D3D11_FENCE_FLAG_NONE, IID_PPV_ARGS(&readbackFence_))))
+            std::fprintf(stderr, "[gpu-hw] CPU readbacks wait on a GPU fence\n");
+        else { context4_.Reset(); readbackFence_.Reset(); }
 
         D3D11_BUFFER_DESC b{};
         b.ByteWidth = VertexRingBytes; b.Usage = D3D11_USAGE_DYNAMIC; b.BindFlags = D3D11_BIND_VERTEX_BUFFER;
@@ -332,7 +362,9 @@ public:
         // Keep each draw's vertices stride-aligned so the base vertex is an integer.
         size_t vbOffset = (ringOffset_ + stride - 1) / stride * stride;
         D3D11_MAP vbMap = D3D11_MAP_WRITE_NO_OVERWRITE;
-        if (vbOffset + vbBytes > VertexRingBytes) { vbOffset = 0; vbMap = D3D11_MAP_WRITE_DISCARD; }
+        const bool vbWrap = vbOffset + vbBytes > VertexRingBytes;
+        if (vbWrap) { vbOffset = 0; if (RingDiscard()) vbMap = D3D11_MAP_WRITE_DISCARD; }
+        if (!RingDiscard()) RingWrite(vertexFence_, VertexRingBytes, vbOffset, vbBytes, vbWrap);
         D3D11_MAPPED_SUBRESOURCE mapped{};
         Check(context_->Map(vertexRing_.Get(), 0, vbMap, 0, &mapped), "MapVertexRing");
         uint8_t* out = static_cast<uint8_t*>(mapped.pData) + vbOffset;
@@ -381,7 +413,9 @@ public:
         }
 
         D3D11_MAP ibMap = D3D11_MAP_WRITE_NO_OVERWRITE;
-        if (indexOffset_ + ibBytes > IndexRingBytes) { indexOffset_ = 0; ibMap = D3D11_MAP_WRITE_DISCARD; }
+        const bool ibWrap = indexOffset_ + ibBytes > IndexRingBytes;
+        if (ibWrap) { indexOffset_ = 0; if (RingDiscard()) ibMap = D3D11_MAP_WRITE_DISCARD; }
+        if (!RingDiscard()) RingWrite(indexFence_, IndexRingBytes, indexOffset_, ibBytes, ibWrap);
         Check(context_->Map(indexRing_.Get(), 0, ibMap, 0, &mapped), "MapIndexRing");
         std::memcpy(static_cast<uint8_t*>(mapped.pData) + indexOffset_, slots.data(), ibBytes);
         context_->Unmap(indexRing_.Get(), 0);
@@ -460,6 +494,7 @@ public:
                 totalDwords += uint64_t(hi[s] - lo[s]);
             }
         if (totalDwords * 4 + 64 > VdataRingBytes || indices.size() * 4 > IndexRingBytes) return GpuVsResult::Fallback;
+        if (toggle_ & 2) return GpuVsResult::Drawn;
 
         ++stats_.draws;
         ++stats_.gpuVsDraws;
@@ -478,7 +513,13 @@ public:
         {
             D3D11_MAP map = D3D11_MAP_WRITE_NO_OVERWRITE;
             size_t start = (vdataOffset_ + 15) & ~size_t(15);
-            if (!vdataNoOverwrite_ || start + totalDwords * 4 > VdataRingBytes) { start = 0; map = D3D11_MAP_WRITE_DISCARD; }
+            if (!vdataNoOverwrite_) { start = 0; map = D3D11_MAP_WRITE_DISCARD; }
+            else
+            {
+                const bool wrap = start + totalDwords * 4 > VdataRingBytes;
+                if (wrap) { start = 0; if (RingDiscard()) map = D3D11_MAP_WRITE_DISCARD; }
+                if (!RingDiscard()) RingWrite(vdataFence_, VdataRingBytes, start, size_t(totalDwords) * 4, wrap);
+            }
             D3D11_MAPPED_SUBRESOURCE m{};
             Check(context_->Map(vdataRing_.Get(), 0, map, 0, &m), "MapVertexData");
             uint32_t* out = static_cast<uint32_t*>(m.pData) + start / 4;
@@ -531,7 +572,9 @@ public:
         // ---- indices
         const size_t ibBytes = indices.size() * 4;
         D3D11_MAP ibMap = D3D11_MAP_WRITE_NO_OVERWRITE;
-        if (indexOffset_ + ibBytes > IndexRingBytes) { indexOffset_ = 0; ibMap = D3D11_MAP_WRITE_DISCARD; }
+        const bool ibWrap = indexOffset_ + ibBytes > IndexRingBytes;
+        if (ibWrap) { indexOffset_ = 0; if (RingDiscard()) ibMap = D3D11_MAP_WRITE_DISCARD; }
+        if (!RingDiscard()) RingWrite(indexFence_, IndexRingBytes, indexOffset_, ibBytes, ibWrap);
         D3D11_MAPPED_SUBRESOURCE mapped{};
         Check(context_->Map(indexRing_.Get(), 0, ibMap, 0, &mapped), "MapIndexRing");
         std::memcpy(static_cast<uint8_t*>(mapped.pData) + indexOffset_, indices.data(), ibBytes);
@@ -609,7 +652,7 @@ public:
         const int64_t x1 = std::clamp<int64_t>(int64_t(st.scX1) * st.sampX, 0, SurfaceW);
         const int64_t y1 = std::clamp<int64_t>(int64_t(st.scY1) * st.sampY, 0, SurfaceH);
         DepthSurface* depth = nullptr;
-        if (st.zEnable)
+        if (st.zEnable || st.stencil)
         {
             depth = &Depth(st.depthBase);
             depth->touched = true; depth->sampX = st.sampX; depth->sampY = st.sampY;
@@ -625,20 +668,24 @@ public:
             needW = std::max({ needW, color.extW, depth->extW });
             needH = std::max({ needH, color.extH, depth->extH });
         }
-        if (st.writeMask) Grow(color, st.colorBase, needW, needH);
-        if (depth) Grow(*depth, st.depthBase, needW, needH);
+        // Native-size pair (a CPU-read bake surface and its depth) or the render scale.
+        const bool native = (st.writeMask && nativeColors_.count(st.colorBase)) || (depth && nativeDepths_.count(st.depthBase));
+        const float sc = native ? 1.0f : scale_;
+        if (st.writeMask && depth) depthWithColor_[st.colorBase] = st.depthBase;
+        if (st.writeMask) Grow(color, st.colorBase, needW, needH, sc);
+        if (depth) Grow(*depth, st.depthBase, needW, needH, sc);
         ID3D11RenderTargetView* rtv = st.writeMask ? color.rtv.Get() : nullptr;
         ID3D11DepthStencilView* dsv = depth ? depth->dsv.Get() : nullptr;
         context_->OMSetRenderTargets(rtv ? 1 : 0, rtv ? &rtv : nullptr, dsv);
         float factor[4];
         context_->OMSetBlendState(BlendState(st, factor), factor, 0xFFFFFFFF);
-        context_->OMSetDepthStencilState(DepthState(st), 0);
+        context_->OMSetDepthStencilState(DepthState(st), StencilRef(st));
         // The sample-space viewport and scissor, times the render scale (vertices stay logical).
-        D3D11_VIEWPORT vp{ 0, 0, float(st.pitch * st.sampX) * scale_, float(SurfaceH) * scale_, 0, 1 };
+        D3D11_VIEWPORT vp{ 0, 0, float(st.pitch * st.sampX) * sc, float(SurfaceH) * sc, 0, 1 };
         context_->RSSetViewports(1, &vp);
-        D3D11_RECT sc{ LONG(Px(std::max(st.scX0, 0) * int(st.sampX))), LONG(Px(std::max(st.scY0, 0) * int(st.sampY))),
-                       LONG(Px(double(x1))), LONG(Px(double(y1))) };
-        context_->RSSetScissorRects(1, &sc);
+        D3D11_RECT scissor{ LONG(Px(std::max(st.scX0, 0) * int(st.sampX), sc)), LONG(Px(std::max(st.scY0, 0) * int(st.sampY), sc)),
+                            LONG(Px(double(x1), sc)), LONG(Px(double(y1), sc)) };
+        context_->RSSetScissorRects(1, &scissor);
         if ((st.cull & 3) == 3) { ++stats_.emptyDraws; return; }          // both faces culled
         context_->RSSetState(RasterState(st));
         context_->PSSetShader(ps, nullptr, 0);
@@ -646,7 +693,7 @@ public:
         context_->PSSetConstantBuffers(0, 2, cbs);
         context_->PSSetShaderResources(0, 32, srvs);
         context_->PSSetSamplers(0, 16, samplers);
-        context_->DrawIndexed(indexCount, firstIndex, baseVertex);
+        if (!(toggle_ & 1)) context_->DrawIndexed(indexCount, firstIndex, baseVertex);
         stats_.triangles += indexCount / 3;
         MaybeReportStats();
     }
@@ -663,15 +710,34 @@ public:
     {
         Initialize();
         UpdateScale();
+        FinishSmallWritebacks();
         ++stats_.resolves;
         const bool depth = srcSelect == 4;
         const bool rg16f = !depth && destFormat == 31;
         Resolved& r = resolved_[dest];
-        if (!r.tex || r.pitch != pitch || r.height != height || r.depth != depth || r.rg16f != rg16f || r.scale != scale_)
+        float sourceScale = scale_;
+        if (depth)
         {
+            auto d = depths_.find(depthBase);
+            if (d != depths_.end() && d->second.tex) sourceScale = d->second.scale;
+        }
+        else if (auto c = colors_.find(colorBase); c != colors_.end() && c->second.tex)
+            sourceScale = c->second.scale;
+        if (!r.tex || r.pitch != pitch || r.height != height || r.depth != depth || r.rg16f != rg16f || r.scale != sourceScale)
+        {
+            const bool hot = r.readbackHot;
+            RetireResolvedTexture(r);
             r = Resolved{};
             r.pitch = pitch; r.height = height; r.depth = depth; r.rg16f = rg16f;
-            MakeResolvedTexture(r);
+            r.readbackHot = hot;
+            MakeResolvedTexture(r, sourceScale);
+        }
+        r.sourceKey = depth ? ~0u : colorBase;
+        if (!depth)
+        {
+            auto& dests = resolveDests_[colorBase];
+            auto [entry, added] = dests.try_emplace(dest, r.readbackHot);
+            if (added || entry->second != r.readbackHot) { entry->second = r.readbackHot; UpdateNative(colorBase); }
         }
         r.depthFloat = depthFloat;
         if (CensusOn() && !censusSeen_[(4ull << 60) ^ (uint64_t(colorBase) << 32) ^ (uint64_t(pitch) << 16) ^ height ^
@@ -683,7 +749,8 @@ public:
         {
             ++stats_.depthResolves;
             auto d = depths_.find(depthBase);
-            if (d != depths_.end() && d->second.touched) BlitDepth(d->second, r);
+            if (toggle_ & 4) {}
+            else if (d != depths_.end() && d->second.touched) BlitDepth(d->second, r);
             else
             {
                 const float farDepth[4] = { 1, 1, 1, 1 };                 // depth surfaces start at 1.0
@@ -708,14 +775,15 @@ public:
             const uint32_t rows = std::min<UINT>(height, SurfaceH);
             // Nothing was ever drawn beyond the surface's extent (it covers every draw's reach):
             // that part reads as the cleared store, zero - the shader blits' out-of-range loads.
-            const UINT copyW = std::min(Px(width), AllocPx(r.pitch)), copyH = std::min(Px(rows), AllocPx(r.height));
-            const UINT haveW = s.tex ? std::min(copyW, AllocPx(s.extW)) : 0, haveH = s.tex ? std::min(copyH, AllocPx(s.extH)) : 0;
+            const float k = r.scale;                // == s.scale: texel for texel
+            const UINT copyW = std::min(Px(width, k), AllocPx(r.pitch, k)), copyH = std::min(Px(rows, k), AllocPx(r.height, k));
+            const UINT haveW = s.tex ? std::min(copyW, AllocPx(s.extW, k)) : 0, haveH = s.tex ? std::min(copyH, AllocPx(s.extH, k)) : 0;
             if ((width != r.copiedWidth && width < pitch) || haveW < copyW || haveH < copyH)
             {
                 const float zero[4] = { 0, 0, 0, 0 };
                 context_->ClearRenderTargetView(r.rtv.Get(), zero);
             }
-            if (!s.tex) {}
+            if (!s.tex || (toggle_ & 4)) {}
             else if (r.rg16f) BlitColor(s, r, width, rows, true);
             else if (s.format != DXGI_FORMAT_B8G8R8A8_UNORM) BlitColor(s, r, width, rows, false);   // convert
             else
@@ -746,21 +814,58 @@ public:
             const char* e = std::getenv("TTT2_SMALL_WRITEBACK");
             return e ? uint32_t(std::strtoul(e, nullptr, 0)) : 32u;
         }();
-        if (writeback || pitch * height <= smallWriteback) WriteBack(dest, r);
+        // Small ones are staged and written into guest memory once the GPU has done the copy
+        // (FinishSmallWritebacks, at the next resolve or present) instead of waiting here: the
+        // exposure readback came once per frame, and its blocking Map (with a new staging texture
+        // each time) made the CP thread wait for the GPU every frame - MEASURED 2026-10-15 on the
+        // TEKKEN TUNES page: 25-45 ms frames, present calls of 6-27 ms. TTT2_SMALL_WRITEBACK_SYNC=1
+        // waits as before.
+        static const bool smallSync = [] { const char* e = std::getenv("TTT2_SMALL_WRITEBACK_SYNC"); return e && *e == '1'; }();
+        if (writeback || (pitch * height <= smallWriteback && smallSync)) WriteBack(dest, r);
+        else if (pitch * height <= smallWriteback) { if (!(toggle_ & 8)) { StageReadback(r); smallPending_.insert(dest); } }
+        else if (r.readbackHot) StageReadback(r);
         MaybeReportStats();
     }
 
     // The CPU is about to read guest bytes in [start, start + size) - a first access through
     // the cached physical view (phys_mirror.cpp). Make every GPU-only resolve overlapping them
-    // coherent first, as the console's shared memory would be.
-    void WriteBackRange(uint32_t start, uint32_t size)
+    // coherent first, as the console's shared memory would be. Returns true while a copy is still
+    // on its way: the caller (GpuHwWriteBackRange) calls again WITHOUT the backend lock in between,
+    // so the command processor keeps drawing and presenting while this thread waits for the GPU
+    // (it used to hold the lock for the whole wait: the fight intro's reads stalled presents by
+    // up to ~15 ms each, MEASURED 2026-10-14). `block` waits in Map instead (the caller's last resort).
+    bool WriteBackRange(uint32_t start, uint32_t size, bool block = false)
     {
+        bool pending = false;
+        pendingFence_ = 0;
         for (auto& [rs, r] : resolved_)
         {
             if (!r.valid || r.cpuCoherent || !r.tex) continue;
             if (!(uint64_t(start) < uint64_t(rs) + r.size && uint64_t(rs) < uint64_t(start) + size)) continue;
             dirty_.Sync(rs, r.size);
             if (dirty_.Newest(rs, r.size) > r.seq) { r.valid = false; continue; }   // the CPU overwrote it
+            if (!r.readbackHot && r.sourceKey != ~0u)
+            {
+                r.readbackHot = true;
+                resolveDests_[r.sourceKey][rs] = true;
+                UpdateNative(r.sourceKey);
+            }
+            r.readbackHot = true;                     // its next resolves are staged for the CPU
+            if (!r.staged || r.stagedSeq != r.seq)
+            {
+                StageReadback(r);                     // not staged yet (a first read): copy now, map later
+                if (!block) { pending = true; pendingFence_ = std::max(pendingFence_, r.stagedFence); continue; }
+            }
+            const auto t0 = std::chrono::steady_clock::now();
+            std::vector<uint32_t> px;
+            if (!ReadStaging(r.staging.Get(), r.pitch, r.height, px, !block))
+            {
+                pending = true;
+                pendingFence_ = std::max(pendingFence_, r.stagedFence);
+                continue;
+            }
+            r.staged = false;
+            lastStagedAgeMs_ = std::chrono::duration<double, std::milli>(t0 - r.stagedAt).count();
             ++writebackCauses_["cpu read through the cached physical view"];
             static int logged = 0;
             if (logged < 40)
@@ -769,9 +874,13 @@ public:
                 std::fprintf(stderr, "[gpu-hw] cpu-read writeback dest=%08X %ux%u swapRB=%d rg16f=%d depth=%d\n",
                              rs, r.pitch, r.height, int(r.swapRB), int(r.rg16f), int(r.depth));
             }
-            WriteBack(rs, r);
+            Scatter(rs, r, px, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
         }
+        return pending;
     }
+
+    // After a pending WriteBackRange: the fence value its copies complete at (0: poll instead).
+    ComPtr<ID3D11Fence> PendingFence(uint64_t& value) const { value = pendingFence_; return value ? readbackFence_ : nullptr; }
 
     // Compare the GPU resolve with the CPU renderer's linear result (compare mode).
     void CompareResolve(uint32_t dest, const uint32_t* cpu, uint32_t pitch, uint32_t height)
@@ -839,8 +948,11 @@ public:
     // unswapped render, so swap only when exactly one of the two exchanges applies.
     bool Present(uint32_t frontBuffer, bool displaySwapRB, const uint32_t* gammaRamp, uint32_t gammaVersion)
     {
+        using clock = std::chrono::steady_clock;
+        const auto t0 = clock::now();
         Initialize();
         UpdateScale();
+        FinishSmallWritebacks();
         UpdateGamma(gammaRamp, gammaVersion);
         bool storedSwap = false;
         uint32_t logicalW = 1280, logicalH = 720;
@@ -859,7 +971,11 @@ public:
             DXGI_SWAP_CHAIN_DESC1 d{};
             d.Width = std::max<LONG>(1, rc.right - rc.left); d.Height = std::max<LONG>(1, rc.bottom - rc.top);
             d.Format = DXGI_FORMAT_B8G8R8A8_UNORM; d.SampleDesc.Count = 1;
-            d.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT; d.BufferCount = 2;
+            // TTT2_SWAP_BUFFERS=3/4 (experiment): MEASURED 2026-10-15 over 5 min of real play,
+            // three buffers neither shortened the fight intro's readback waits (median 7.6 ms
+            // either way) nor reduced dropped frames, so two stay the default.
+            static const UINT buffers = [] { const char* e = std::getenv("TTT2_SWAP_BUFFERS"); const int n = e ? std::atoi(e) : 2; return UINT(std::clamp(n, 2, 4)); }();
+            d.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT; d.BufferCount = buffers;
             d.Scaling = DXGI_SCALING_STRETCH; d.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
             d.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
             d.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
@@ -868,13 +984,80 @@ public:
             bufW_ = d.Width; bufH_ = d.Height;
             std::fprintf(stderr, "[gpu-hw] presenting through a DXGI flip swap chain (%ux%u)\n", bufW_, bufH_);
         }
+        const auto t1 = clock::now();
         ApplyDisplay(w);
         ComPtr<ID3D11Texture2D> back;
         Check(swapchain_->GetBuffer(0, IID_PPV_ARGS(&back)), "GetBackBuffer");
         const bool swap = storedSwap != displaySwapRB;
+        const auto t2 = clock::now();
         PresentScaled(source, back.Get(), swap);
         lastSwap_ = swap;
-        HRESULT hr = swapchain_->Present(0, 0);
+        const auto t3 = clock::now();
+        static const bool noWait = [] { const char* e = std::getenv("TTT2_PRESENT_NOWAIT"); return e && *e == '1'; }();
+        static const bool diag = [] { const char* e = std::getenv("TTT2_PRESENT_DIAG"); return e && *e == '1'; }();
+        if (diag)
+        {
+            // Diagnostics: the flush, then the GPU draining everything queued, timed apart from Present.
+            using ms = std::chrono::duration<double, std::milli>;
+            if (!diagQuery_)
+            {
+                D3D11_QUERY_DESC q{ D3D11_QUERY_EVENT, 0 };
+                device_->CreateQuery(&q, &diagQuery_);
+            }
+            const auto a = clock::now();
+            context_->Flush();
+            const auto b = clock::now();
+            context_->End(diagQuery_.Get());
+            BOOL done = FALSE;
+            while (context_->GetData(diagQuery_.Get(), &done, sizeof(done), 0) != S_OK || !done) YieldProcessor();
+            const auto c = clock::now();
+            diagFlushMs_ += ms(b - a).count();
+            diagDrainMs_ += ms(c - b).count();
+            diagDrainMax_ = (std::max)(diagDrainMax_, ms(c - b).count());
+        }
+        HRESULT hr = (toggle_ & 16) ? S_OK : swapchain_->Present(0, noWait ? DXGI_PRESENT_DO_NOT_WAIT : 0);
+        const auto t4 = clock::now();
+        if (hr == DXGI_ERROR_WAS_STILL_DRAWING) { ++presentHist_[7]; hr = S_OK; }
+        Probe("present");
+        {
+            // TTT2_FRAMETIME=1: where a slow present call goes.
+            static const bool timing = [] { const char* e = std::getenv("TTT2_FRAMETIME"); return e && *e == '1'; }();
+            using ms = std::chrono::duration<double, std::milli>;
+            auto printHist = [&] {
+                const uint32_t n = (std::max)(presentHist_[6], 1u);
+                std::fprintf(stderr, "[frame] DXGI Present over %u calls (toggle %X): <1 ms %u, 1-3 %u, 3-6 %u, 6-10 %u, 10-20 %u, >20 %u, mean %.2f ms, would block %u; flush mean %.2f ms, GPU drain mean %.2f max %.2f ms\n",
+                             presentHist_[6], toggle_, presentHist_[0], presentHist_[1], presentHist_[2], presentHist_[3], presentHist_[4], presentHist_[5],
+                             presentHistMs_ / n, presentHist_[7], diagFlushMs_ / n, diagDrainMs_ / n, diagDrainMax_);
+                presentHist_ = {};
+                presentHistMs_ = diagFlushMs_ = diagDrainMs_ = diagDrainMax_ = 0;
+            };
+            // TTT2_HW_TOGGLE=1 (diagnostics): C:/ttt2/port/hw_toggle.txt, a hex mask re-read every 30
+            // presents, switches parts of each frame off live (the picture breaks): 1 draw calls,
+            // 2 GPU-VS draws whole (vertex data too), 4 resolve copies, 8 staged readbacks,
+            // 16 DXGI Present, 32 constant uploads.
+            static const bool toggleFile = [] { const char* e = std::getenv("TTT2_HW_TOGGLE"); return e && *e == '1'; }();
+            if (toggleFile && stats_.presents % 30 == 0)
+            {
+                uint32_t mask = 0;
+                if (FILE* f = std::fopen("C:/ttt2/port/hw_toggle.txt", "r")) { if (std::fscanf(f, "%x", &mask) < 1) mask = 0; std::fclose(f); }
+                if (mask != toggle_)
+                {
+                    if (timing) printHist();
+                    toggle_ = mask;
+                }
+            }
+            if (timing)
+            {
+                const double d = ms(t4 - t3).count();
+                ++presentHist_[d < 1 ? 0 : d < 3 ? 1 : d < 6 ? 2 : d < 10 ? 3 : d < 20 ? 4 : 5];
+                presentHistMs_ += d;
+                if (++presentHist_[6] == 600) printHist();
+            }
+            static int logged = 0;
+            if (timing && ms(t4 - t0).count() > 10.0 && logged++ < 300)
+                std::fprintf(stderr, "[frame] present call %.1f ms: front texture %.1f, display %.1f, scaled copy %.1f, DXGI Present %.1f\n",
+                             ms(t4 - t0).count(), ms(t1 - t0).count(), ms(t2 - t1).count(), ms(t3 - t2).count(), ms(t4 - t3).count());
+        }
         buildBudgetMs_ = 24;
         if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) Check(hr, "Present");
         if (hr != lastPresentHr_)
@@ -898,9 +1081,10 @@ public:
             for (uint32_t& v : px) v = DisplayPixel(v);
             WriteBmp("C:/ttt2/port/fb_native.bmp", px.data(), sd.Width, sd.Height);
         }
-        if (stats_.presents % 30 == 0)
+        static const bool overrideFile = [] { const char* e = std::getenv("TTT2_HW_OVERRIDE"); return e && *e == '1'; }();
+        if (overrideFile && stats_.presents % 30 == 0)
         {
-            // Diagnostics: C:/ttt2/port/hw_override.txt = hex mask of texture slots to force white.
+            // Diagnostics (TTT2_HW_OVERRIDE=1): C:/ttt2/port/hw_override.txt = hex mask of texture slots to force white.
             // Optional second token: only pixel shaders of that many dwords.
             uint32_t mask = 0, dwords = 0;
             if (FILE* f = std::fopen("C:/ttt2/port/hw_override.txt", "r"))
@@ -997,6 +1181,11 @@ private:
     std::chrono::steady_clock::time_point lastExclusiveTry_{};
     display_settings::Resolution exclusiveRes_{ 0, 0 };     // display mode set for exclusive fullscreen
     HRESULT lastPresentHr_ = S_OK;
+    uint32_t toggle_ = 0;                         // TTT2_HW_TOGGLE
+    std::array<uint32_t, 8> presentHist_{};      // TTT2_FRAMETIME: DXGI Present durations, calls, would-block
+    double presentHistMs_ = 0;
+    ComPtr<ID3D11Query> diagQuery_;              // TTT2_PRESENT_DIAG
+    double diagFlushMs_ = 0, diagDrainMs_ = 0, diagDrainMax_ = 0;
     bool resizeNeeded_ = false;                               // resize the buffers at the next present
     std::chrono::steady_clock::time_point lastInvalidRetry_{};
     void ApplyDisplay(HWND w)
@@ -1166,19 +1355,32 @@ private:
         return p;
     }
 
-    // extW / extH: the logical area held, in samples (the texture is scale_ times that).
+    // extW / extH: the logical area held, in samples (the texture is `scale` times that: the
+    // render scale, or 1 for a surface rendered at native size - see NativeSize).
     struct ColorSurface { ComPtr<ID3D11Texture2D> tex; ComPtr<ID3D11RenderTargetView> rtv; ComPtr<ID3D11ShaderResourceView> srv;
                           bool touched = false; uint32_t samplePitch = 0; DXGI_FORMAT format = DXGI_FORMAT_B8G8R8A8_UNORM;
-                          UINT extW = 0, extH = 0; };
+                          UINT extW = 0, extH = 0; float scale = 1.0f; };
     struct DepthSurface { ComPtr<ID3D11Texture2D> tex; ComPtr<ID3D11DepthStencilView> dsv; ComPtr<ID3D11ShaderResourceView> srv;
-                          bool touched = false; uint32_t sampX = 1, sampY = 1; UINT extW = 0, extH = 0; };
+                          bool touched = false; uint32_t sampX = 1, sampY = 1; UINT extW = 0, extH = 0; float scale = 1.0f; };
     struct Resolved
     {
         ComPtr<ID3D11Texture2D> tex; ComPtr<ID3D11ShaderResourceView> srv; ComPtr<ID3D11RenderTargetView> rtv;
         uint32_t pitch = 0, height = 0, copiedWidth = 0, size = 0, seq = 0;   // logical (guest) pixels
         bool valid = false, cpuCoherent = false, swapRB = false, depth = false, depthFloat = false;
         bool rg16f = false;          // 16_16_FLOAT destination (R16G16_FLOAT texture)
-        float scale = 1.0f;          // render scale the texture was made at
+        float scale = 1.0f;          // render scale the texture was made at (its source surface's)
+        uint32_t sourceKey = ~0u, sourceDepth = ~0u;   // colour surface key / depth base it came from
+        // CPU readback (WriteBack). Once the CPU has read this destination, each later resolve
+        // starts its copy to `staging` at once (StageReadback), so the read finds it done instead
+        // of waiting for the GPU: the fight intro reads its 1024x1024 bake ~100 times, 9.4 ms each
+        // (MEASURED 2026-10-14, every ~4th frame late).
+        bool readbackHot = false, staged = false;
+        uint32_t stagedSeq = 0;
+        std::chrono::steady_clock::time_point stagedAt{};   // when the staged copy was queued
+        uint64_t stagedFence = 0;                            // readbackFence_ value after that copy
+        ComPtr<ID3D11Texture2D> logical;          // scaled: the logical-size copy the CPU reads
+        ComPtr<ID3D11RenderTargetView> logicalRtv;
+        ComPtr<ID3D11Texture2D> staging;
     };
     struct TexKey
     {
@@ -1195,7 +1397,7 @@ private:
     struct Bound { ID3D11ShaderResourceView* srv; uint32_t swizzle, mode, width, height; float scaleX, scaleY; uint32_t slices = 1; };
     struct Stats { uint64_t draws = 0, triangles = 0, skippedDraws = 0, emptyDraws = 0, resolves = 0, presents = 0,
                    compiles = 0, diskHits = 0, uploads = 0, uploadBytes = 0, resolvedHits = 0, writebacks = 0,
-                   depthResolves = 0, depthHits = 0, gpuVsDraws = 0, vertexDataBytes = 0, warmHits = 0, pendingSkips = 0; };
+                   depthResolves = 0, depthHits = 0, gpuVsDraws = 0, vertexDataBytes = 0, warmHits = 0, pendingSkips = 0, stagedReadbacks = 0, ringWaits = 0, resolveCreates = 0, resolvePoolHits = 0; double ringWaitMs = 0; };
 public:
     // Device-removed diagnostics for the failure log (DXGI reason code).
     HRESULT RemovedReason() const { return device_ ? device_->GetDeviceRemovedReason() : S_OK; }
@@ -1261,6 +1463,49 @@ private:
 
     ComPtr<ID3D11Device> device_;
     ComPtr<ID3D11DeviceContext> context_;
+    // CPU-read readbacks: a fence signalled after each staged copy, so the reading thread can wait
+    // for exactly that copy without the context or the backend lock (ID3D11Fence is free-threaded).
+    ComPtr<ID3D11DeviceContext4> context4_;
+    ComPtr<ID3D11Fence> readbackFence_;
+    uint64_t readbackFenceValue_ = 0, pendingFence_ = 0;
+    // TTT2_GPU_PROBE=1 (diagnostics): the fence also marks every present and staged copy; a thread
+    // logs each one the GPU passes more than 4 ms after it was queued (what holds the GPU queue?).
+    struct ProbeMark { uint64_t value; const char* label; std::chrono::steady_clock::time_point queued; };
+    std::mutex probeMutex_;
+    std::condition_variable probeWake_;
+    std::deque<ProbeMark> probeMarks_;
+    void Probe(const char* label)
+    {
+        static const bool on = [] { const char* e = std::getenv("TTT2_GPU_PROBE"); return e && *e == '1'; }();
+        if (!on || !readbackFence_) return;
+        static std::once_flag started;
+        std::call_once(started, [this] {
+            std::thread([this] {
+                HANDLE done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                int logged = 0;
+                for (;;)
+                {
+                    ProbeMark m;
+                    {
+                        std::unique_lock l(probeMutex_);
+                        probeWake_.wait(l, [this] { return !probeMarks_.empty(); });
+                        m = probeMarks_.front();
+                        probeMarks_.pop_front();
+                    }
+                    if (FAILED(readbackFence_->SetEventOnCompletion(m.value, done))) continue;
+                    WaitForSingleObject(done, 2000);
+                    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - m.queued).count();
+                    if (ms > 4.0 && logged++ < 2000) std::fprintf(stderr, "[gpu-probe] %s passed %.2f ms after it was queued\n", m.label, ms);
+                }
+            }).detach();
+        });
+        context4_->Signal(readbackFence_.Get(), ++readbackFenceValue_);
+        {
+            std::lock_guard l(probeMutex_);
+            probeMarks_.push_back({ readbackFenceValue_, label, std::chrono::steady_clock::now() });
+        }
+        probeWake_.notify_one();
+    }
     ComPtr<ID3D11Buffer> vertexRing_, indexRing_, psConstants_, psState_;
     ComPtr<ID3D11RasterizerState> raster_;
     ComPtr<ID3D11SamplerState> pointClamp_, linearClamp_;
@@ -1316,7 +1561,7 @@ private:
         context_->OMSetRenderTargets(1, &rtv, nullptr);
         context_->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
         context_->OMSetDepthStencilState(nullptr, 0);
-        w = Px(w); h = Px(h);                       // texel for texel: both sides carry the scale
+        w = Px(w, s.scale); h = Px(h, s.scale);     // texel for texel: both sides carry the scale
         D3D11_VIEWPORT vp{ 0, 0, float(w), float(h), 0, 1 };
         context_->RSSetViewports(1, &vp);
         context_->RSSetState(raster_.Get());
@@ -1356,7 +1601,7 @@ private:
         context_->OMSetRenderTargets(1, &rtv, nullptr);
         context_->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
         context_->OMSetDepthStencilState(nullptr, 0);
-        const UINT w = std::min(Px(lw), AllocPx(r.pitch)), h = std::min(Px(lh), AllocPx(r.height));
+        const UINT w = std::min(Px(lw, s.scale), AllocPx(r.pitch, r.scale)), h = std::min(Px(lh, s.scale), AllocPx(r.height, r.scale));
         D3D11_VIEWPORT vp{ 0, 0, float(w), float(h), 0, 1 };
         context_->RSSetViewports(1, &vp);
         context_->RSSetState(raster_.Get());
@@ -1379,6 +1624,65 @@ private:
         Check(device_->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr, &blitVs_), "CreateBlitVs");
     }
     size_t ringOffset_ = 0, indexOffset_ = 0, vdataOffset_ = 0;
+    // The dynamic rings wrap without DISCARD. MEASURED 2026-10-15 on Sakura Schoolyard (7 MB of
+    // guest vertex data a frame): DISCARD at each wrap had the driver rename the 64 MB ring every
+    // ~9 frames - a fresh allocation the kernel pages on the copy engine (the System process at
+    // ~10% copy) - and presents across the whole desktop (other programs' too) blocked 10-20 ms on
+    // a quarter of the frames. Instead each ring is eight chunks, an event query marking the last
+    // command that read each one; writing into a chunk again first waits for its query - long
+    // done in practice, the ring holding several frames. TTT2_RING_DISCARD=1: the old wraps.
+    struct RingFence
+    {
+        static constexpr size_t Chunks = 8;
+        size_t chunk = 0;                         // bytes per chunk
+        ComPtr<ID3D11Query> done[Chunks];
+        bool issued[Chunks] = {};                 // query ended for the chunk's previous cycle
+        size_t cur = SIZE_MAX, ended = 0;         // furthest chunk written this cycle; chunks [0, ended) marked
+    };
+    RingFence vertexFence_, indexFence_, vdataFence_;
+    static bool RingDiscard()
+    {
+        static const bool on = [] { const char* e = std::getenv("TTT2_RING_DISCARD"); return e && *e == '1'; }();
+        return on;
+    }
+    // Before writing [start, start + bytes) of a ring of `ringBytes`; `wrapped`: the write restarts it at 0.
+    void RingWrite(RingFence& f, size_t ringBytes, size_t start, size_t bytes, bool wrapped)
+    {
+        if (!f.chunk)
+        {
+            f.chunk = ringBytes / RingFence::Chunks;
+            for (auto& q : f.done)
+            {
+                D3D11_QUERY_DESC d{ D3D11_QUERY_EVENT, 0 };
+                Check(device_->CreateQuery(&d, &q), "CreateRingQuery");
+            }
+        }
+        auto mark = [&](size_t c) { context_->End(f.done[c].Get()); f.issued[c] = true; };
+        if (wrapped)
+        {
+            if (f.cur != SIZE_MAX)
+                for (size_t c = f.ended; c <= f.cur; ++c) mark(c);
+            f.cur = SIZE_MAX;
+            f.ended = 0;
+        }
+        // Chunks before this write's start: every command reading them is already queued.
+        const size_t first = start / f.chunk, last = std::min(RingFence::Chunks - 1, (start + std::max<size_t>(bytes, 1) - 1) / f.chunk);
+        for (; f.ended < first; ++f.ended) mark(f.ended);
+        for (size_t c = f.cur == SIZE_MAX ? 0 : f.cur + 1; c <= last; ++c)
+        {
+            if (!f.issued[c]) continue;
+            BOOL done = FALSE;
+            if (context_->GetData(f.done[c].Get(), &done, sizeof(done), 0) != S_OK)
+            {
+                const auto t0 = std::chrono::steady_clock::now();
+                while (context_->GetData(f.done[c].Get(), &done, sizeof(done), 0) != S_OK) YieldProcessor();
+                ++stats_.ringWaits;
+                stats_.ringWaitMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            }
+            f.issued[c] = false;
+        }
+        if (f.cur == SIZE_MAX || last > f.cur) f.cur = last;
+    }
     std::array<uint32_t, 1024> lastPsConstants_{};
     std::array<uint32_t, 2048> lastVsConstants_{};
     bool vsConstantsValid_ = false, vdataNoOverwrite_ = false, gpuVsEnabled_ = true;
@@ -1399,7 +1703,7 @@ private:
     std::unordered_map<uint64_t, PsEntry> preparedPs_;
     double buildBudgetMs_ = 24;                         // per frame, for waiting on async builds
     std::unordered_map<uint64_t, ComPtr<ID3D11BlendState>> blendStates_;
-    std::unordered_map<uint32_t, ComPtr<ID3D11DepthStencilState>> depthStates_;
+    std::unordered_map<uint64_t, ComPtr<ID3D11DepthStencilState>> depthStates_;
     std::unordered_map<uint32_t, ComPtr<ID3D11RasterizerState>> rasterStates_;
     DirtyTracker dirty_;
     Stats stats_, reported_;
@@ -1407,6 +1711,8 @@ private:
     std::filesystem::path shaderCacheDir_;
     uint64_t compares_ = 0;
     uint32_t dumps_ = 0;
+    double lastStagedAgeMs_ = 0;                        // the last staged readback's copy: queued this long before its read
+    double lastMapWaitMs_ = 0;                          // the last ReadTexture's wait for the GPU (TTT2_FRAMETIME)
 
     // ----------------------------------------------------------------- helpers
     static ComPtr<ID3DBlob> Compile(const std::string& text, const char* target, const char* name,
@@ -1443,6 +1749,7 @@ private:
 
     void Upload(ID3D11Buffer* buffer, const void* data, size_t size)
     {
+        if (toggle_ & 32) return;
         D3D11_MAPPED_SUBRESOURCE m{};
         Check(context_->Map(buffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &m), "MapConstants");
         std::memcpy(m.pData, data, size);
@@ -1726,8 +2033,65 @@ private:
     // size; everything the guest sees stays logical. Px: one rounding for every size and edge.
     float scale_ = 1.0f;
     uint32_t scaleGeneration_ = ~0u;
-    UINT Px(double logical) const { return UINT(std::floor(logical * scale_ + 0.5)); }
-    UINT AllocPx(double logical) const { return std::clamp<UINT>(Px(logical), 1, D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION); }
+    UINT Px(double logical) const { return Px(logical, scale_); }
+    UINT AllocPx(double logical) const { return AllocPx(logical, scale_); }
+    static UINT Px(double logical, float scale) { return UINT(std::floor(logical * scale + 0.5)); }
+    static UINT AllocPx(double logical, float scale) { return std::clamp<UINT>(Px(logical, scale), 1, D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION); }
+
+    // ---- native-size surfaces. The fight intro bakes each fighter's textures: draws into a
+    // 1024x1024 surface, a resolve, and the CPU reads it back and recompresses it. At render scale
+    // 2 every bake drew 2048x2048 and the GPU took ~6 ms per bake (CPU waiting; MEASURED
+    // 2026-10-15: copy latency median 5.6 ms at scale 2, 3.1 ms at scale 1, ~0.9 s per intro). Extra
+    // resolution there buys nothing - the CPU reads the logical size - so such a bake surface
+    // (UpdateNative) renders at scale 1, with its depth surface.
+    // TTT2_NATIVE_READBACK=0 keeps them scaled.
+    std::unordered_map<uint32_t, std::unordered_map<uint32_t, bool>> resolveDests_;   // colour key -> dest -> CPU-read
+    std::unordered_map<uint32_t, uint32_t> depthWithColor_;                          // colour key -> depth base last drawn with it
+    std::unordered_set<uint32_t> nativeColors_, nativeDepths_;
+    static bool NativeReadbackOn()
+    {
+        static const bool on = [] { const char* e = std::getenv("TTT2_NATIVE_READBACK"); return !(e && *e == '0'); }();
+        return on;
+    }
+    // Re-evaluate colour surface `key` after its resolves changed (a new destination, or one the
+    // CPU read).
+    void UpdateNative(uint32_t key)
+    {
+        if (!NativeReadbackOn() || key == ~0u) return;
+        auto it = resolveDests_.find(key);
+        // A texture bake: the CPU reads a square power-of-two resolve of it (1024x1024, 512x512), and
+        // the surface is no bigger than that - never a scene-sized one (1280x720 and up), whose
+        // resolves the GPU samples. Its other resolves are the bake's own intermediate layers
+        // (MEASURED: 004C0 -> A751B000 read by the CPU, A7B6B000 sampled back into the bake).
+        bool cpuOnly = false;
+        const auto surface = colors_.find(key);
+        if (it != resolveDests_.end() && surface != colors_.end() && surface->second.extW <= 1024 && surface->second.extH <= 1024)
+            for (const auto& [dest, cpu] : it->second)
+            {
+                const auto r = resolved_.find(dest);
+                if (cpu && r != resolved_.end() && r->second.pitch == r->second.height && r->second.pitch >= 256 &&
+                    (r->second.pitch & (r->second.pitch - 1)) == 0)
+                    cpuOnly = true;
+            }
+        const bool was = nativeColors_.count(key) != 0;
+        if (cpuOnly == was) return;
+        const auto d = depthWithColor_.find(key);
+        if (cpuOnly)
+        {
+            nativeColors_.insert(key);
+            if (d != depthWithColor_.end()) nativeDepths_.insert(d->second);
+        }
+        else
+        {
+            nativeColors_.erase(key);
+            if (d != depthWithColor_.end()) nativeDepths_.erase(d->second);
+        }
+        static int logged = 0;
+        if (logged++ < 32)
+            std::fprintf(stderr, "[gpu-hw] colour surface %05X (depth %03X) now renders at %s (%s)\n", key,
+                         d != depthWithColor_.end() ? d->second : 0xFFFu, cpuOnly ? "native size" : "the render scale",
+                         cpuOnly ? "a texture bake the CPU reads back" : "no longer a texture bake");
+    }
     static float RequestedScale()
     {
         if (const char* e = std::getenv("TTT2_RENDER_SCALE"); e && *e)
@@ -1752,10 +2116,11 @@ private:
         need = std::min(std::max(need, 1u), limit);
         return need <= have ? have : std::min((need + step - 1) / step * step, limit);
     }
-    void MakeColorTexture(ColorSurface& s)
+    void MakeColorTexture(ColorSurface& s, float scale)
     {
+        s.scale = scale;
         D3D11_TEXTURE2D_DESC t{};
-        t.Width = AllocPx(s.extW); t.Height = AllocPx(s.extH); t.MipLevels = t.ArraySize = 1;
+        t.Width = AllocPx(s.extW, scale); t.Height = AllocPx(s.extH, scale); t.MipLevels = t.ArraySize = 1;
         t.Format = s.format; t.SampleDesc.Count = 1; t.Usage = D3D11_USAGE_DEFAULT;
         t.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
         s.tex.Reset(); s.rtv.Reset(); s.srv.Reset();
@@ -1765,58 +2130,73 @@ private:
         const float zero[4] = { 0, 0, 0, 0 };          // the CPU store starts zeroed
         context_->ClearRenderTargetView(s.rtv.Get(), zero);
     }
-    void MakeDepthTexture(DepthSurface& s)
+    void MakeDepthTexture(DepthSurface& s, float scale)
     {
+        s.scale = scale;
         D3D11_TEXTURE2D_DESC t{};
-        t.Width = AllocPx(s.extW); t.Height = AllocPx(s.extH); t.MipLevels = t.ArraySize = 1;
+        t.Width = AllocPx(s.extW, scale); t.Height = AllocPx(s.extH, scale); t.MipLevels = t.ArraySize = 1;
         // Typeless so depth resolves can read it as R32_FLOAT (shader copy: D3D11 cannot
-        // CopySubresourceRegion a sub-rectangle of a depth-stencil resource).
-        t.Format = DXGI_FORMAT_R32_TYPELESS; t.SampleDesc.Count = 1; t.Usage = D3D11_USAGE_DEFAULT;
+        // CopySubresourceRegion a sub-rectangle of a depth-stencil resource). 32-bit float depth
+        // and the 8-bit stencil the console's D24FS8 / D24S8 has (TTT2's fight-end depth of field
+        // marks the characters in stencil; without it the stage blurred into a flat colour).
+        t.Format = DXGI_FORMAT_R32G8X24_TYPELESS; t.SampleDesc.Count = 1; t.Usage = D3D11_USAGE_DEFAULT;
         t.BindFlags = D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE;
         s.tex.Reset(); s.dsv.Reset(); s.srv.Reset();
         Check(device_->CreateTexture2D(&t, nullptr, &s.tex), "CreateDepthSurface");
         D3D11_DEPTH_STENCIL_VIEW_DESC dv{};
-        dv.Format = DXGI_FORMAT_D32_FLOAT; dv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+        dv.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT; dv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
         Check(device_->CreateDepthStencilView(s.tex.Get(), &dv, &s.dsv), "CreateDsv");
         D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
-        sv.Format = DXGI_FORMAT_R32_FLOAT; sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; sv.Texture2D.MipLevels = 1;
+        sv.Format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS; sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D; sv.Texture2D.MipLevels = 1;
         Check(device_->CreateShaderResourceView(s.tex.Get(), &sv, &s.srv), "CreateDepthSrv");
-        context_->ClearDepthStencilView(s.dsv.Get(), D3D11_CLEAR_DEPTH, 1.0f, 0);   // CPU store starts at 1.0
+        context_->ClearDepthStencilView(s.dsv.Get(), D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);   // CPU store starts at 1.0
     }
-    void LogGrowth(const char* kind, uint32_t key, UINT w, UINT h)
+    void LogGrowth(const char* kind, uint32_t key, UINT w, UINT h, float scale)
     {
         static int logged = 0;
         if (logged++ < 64)
             std::fprintf(stderr, "[gpu-hw] %s surface %05X covers %ux%u samples (%ux%u at scale %.2f)\n",
-                         kind, key, w, h, AllocPx(w), AllocPx(h), scale_);
+                         kind, key, w, h, AllocPx(w, scale), AllocPx(h, scale), scale);
     }
     // Make the surface cover logical samples [0, w) x [0, h): created, or re-created larger with
     // its contents copied (the new area starts cleared, as the CPU store does).
-    void Grow(ColorSurface& s, uint32_t key, UINT w, UINT h)
+    // ... at `scale` (a change of scale resamples the contents).
+    void Grow(ColorSurface& s, uint32_t key, UINT w, UINT h, float scale)
     {
         w = Extent(w, s.extW, 128, SurfaceW); h = Extent(h, s.extH, 64, SurfaceH);
-        if (s.tex && w == s.extW && h == s.extH) return;
+        if (s.tex && w == s.extW && h == s.extH && s.scale == scale) return;
         ComPtr<ID3D11Texture2D> old = s.tex;
-        const UINT oldW = AllocPx(s.extW), oldH = AllocPx(s.extH);
+        ComPtr<ID3D11ShaderResourceView> oldSrv = s.srv;
+        const float oldScale = s.scale;
+        const UINT oldW = AllocPx(s.extW, oldScale), oldH = AllocPx(s.extH, oldScale);
+        const UINT oldExtW = s.extW, oldExtH = s.extH;
         s.extW = w; s.extH = h;
-        MakeColorTexture(s);
-        if (old)
+        MakeColorTexture(s, scale);
+        if (old && oldScale == scale)
         {
             D3D11_BOX box{ 0, 0, 0, oldW, oldH, 1 };
             context_->CopySubresourceRegion(s.tex.Get(), 0, 0, 0, 0, old.Get(), 0, &box);
         }
-        LogGrowth("colour", key, w, h);
+        else if (old)
+            Resample(oldSrv.Get(), s.rtv.Get(), nullptr, AllocPx(oldExtW, scale), AllocPx(oldExtH, scale), 1.0f / float(AllocPx(oldExtW, scale)),
+                     1.0f / float(AllocPx(oldExtH, scale)), Filterable(s.format));
+        LogGrowth("colour", key, w, h, scale);
     }
-    void Grow(DepthSurface& s, uint32_t key, UINT w, UINT h)
+    void Grow(DepthSurface& s, uint32_t key, UINT w, UINT h, float scale)
     {
         w = Extent(w, s.extW, 128, SurfaceW); h = Extent(h, s.extH, 64, SurfaceH);
-        if (s.tex && w == s.extW && h == s.extH) return;
+        if (s.tex && w == s.extW && h == s.extH && s.scale == scale) return;
         ComPtr<ID3D11ShaderResourceView> old = s.srv;
-        const UINT oldW = AllocPx(s.extW), oldH = AllocPx(s.extH);
+        const UINT oldW = AllocPx(s.extW, s.scale), oldH = AllocPx(s.extH, s.scale);
+        const UINT oldExtW = s.extW, oldExtH = s.extH;
+        const float oldScale = s.scale;
         s.extW = w; s.extH = h;
-        MakeDepthTexture(s);
-        if (old) Resample(old.Get(), nullptr, s.dsv.Get(), oldW, oldH, 1.0f / float(oldW), 1.0f / float(oldH), false);
-        LogGrowth("depth", key, w, h);
+        MakeDepthTexture(s, scale);
+        if (old && oldScale == scale) Resample(old.Get(), nullptr, s.dsv.Get(), oldW, oldH, 1.0f / float(oldW), 1.0f / float(oldH), false);
+        else if (old)
+            Resample(old.Get(), nullptr, s.dsv.Get(), AllocPx(oldExtW, scale), AllocPx(oldExtH, scale), 1.0f / float(AllocPx(oldExtW, scale)),
+                     1.0f / float(AllocPx(oldExtH, scale)), false);
+        LogGrowth("depth", key, w, h, scale);
     }
 
     // Draw into `dst` (an RTV, or a DSV through SV_Depth) over [0, w) x [0, h), reading `src`
@@ -1883,46 +2263,79 @@ private:
         scale_ = s;
         for (auto& [key, c] : colors_)
         {
-            if (!c.tex) continue;
+            const float k = nativeColors_.count(key) ? 1.0f : s;
+            if (!c.tex || c.scale == k) continue;
             ComPtr<ID3D11ShaderResourceView> src = c.srv;
-            MakeColorTexture(c);
-            Resample(src.Get(), c.rtv.Get(), nullptr, AllocPx(c.extW), AllocPx(c.extH),
-                     1.0f / float(AllocPx(c.extW)), 1.0f / float(AllocPx(c.extH)), Filterable(c.format));
+            MakeColorTexture(c, k);
+            Resample(src.Get(), c.rtv.Get(), nullptr, AllocPx(c.extW, k), AllocPx(c.extH, k),
+                     1.0f / float(AllocPx(c.extW, k)), 1.0f / float(AllocPx(c.extH, k)), Filterable(c.format));
         }
         for (auto& [key, d] : depths_)
         {
-            if (!d.tex) continue;
+            const float k = nativeDepths_.count(key) ? 1.0f : s;
+            if (!d.tex || d.scale == k) continue;
             ComPtr<ID3D11ShaderResourceView> src = d.srv;
-            MakeDepthTexture(d);
-            Resample(src.Get(), nullptr, d.dsv.Get(), AllocPx(d.extW), AllocPx(d.extH),
-                     1.0f / float(AllocPx(d.extW)), 1.0f / float(AllocPx(d.extH)), false);
+            MakeDepthTexture(d, k);
+            Resample(src.Get(), nullptr, d.dsv.Get(), AllocPx(d.extW, k), AllocPx(d.extH, k),
+                     1.0f / float(AllocPx(d.extW, k)), 1.0f / float(AllocPx(d.extH, k)), false);
         }
         for (auto& [dest, r] : resolved_)
         {
-            if (!r.tex) continue;
+            if (!r.tex || r.scale != old) continue;         // native-size resolves stay at 1
             ComPtr<ID3D11ShaderResourceView> src = r.srv;
-            MakeResolvedTexture(r);
-            Resample(src.Get(), r.rtv.Get(), nullptr, AllocPx(r.pitch), AllocPx(r.height),
-                     1.0f / float(AllocPx(r.pitch)), 1.0f / float(AllocPx(r.height)), !r.depth);
+            MakeResolvedTexture(r, s);
+            Resample(src.Get(), r.rtv.Get(), nullptr, AllocPx(r.pitch, s), AllocPx(r.height, s),
+                     1.0f / float(AllocPx(r.pitch, s)), 1.0f / float(AllocPx(r.height, s)), !r.depth);
         }
         lastFront_.Reset();
+        resolvePool_.clear();                               // sized for the old scale
         std::fprintf(stderr, "[gpu-hw] render scale %.2f -> %.2f (%zu colour, %zu depth surfaces, %zu resolved textures resampled; %.0f MB)\n",
                      old, s, colors_.size(), depths_.size(), resolved_.size(), SurfaceMegabytes());
     }
-    void MakeResolvedTexture(Resolved& r)
+    // Resolve textures a destination gave up when it changed shape, by allocation size and format,
+    // for the next destination of that shape. MEASURED 2026-10-15 on Sakura Schoolyard: ~13
+    // destinations a frame alternated between shapes (one scratch address resolved at several
+    // sizes) with a CreateTexture2D each time - 630 kernel allocations a second, each zero-filled
+    // on the copy engine (the System process at ~10% copy) - and presents across the whole desktop,
+    // other programs' too, blocked 10-20 ms on a quarter of the frames.
+    struct PooledResolve { ComPtr<ID3D11Texture2D> tex; ComPtr<ID3D11ShaderResourceView> srv; ComPtr<ID3D11RenderTargetView> rtv; };
+    std::unordered_map<uint64_t, std::vector<PooledResolve>> resolvePool_;
+    static uint64_t ResolvePoolKey(UINT w, UINT h, DXGI_FORMAT f) { return (uint64_t(w) << 40) | (uint64_t(h) << 16) | uint64_t(f); }
+    void RetireResolvedTexture(Resolved& r)
+    {
+        static const bool on = [] { const char* e = std::getenv("TTT2_RESOLVE_POOL"); return !(e && *e == '0'); }();
+        if (!on || !r.tex || !r.srv || !r.rtv || r.tex == lastFront_) return;     // the screenshot source keeps its content
+        D3D11_TEXTURE2D_DESC d{};
+        r.tex->GetDesc(&d);
+        auto& v = resolvePool_[ResolvePoolKey(d.Width, d.Height, d.Format)];
+        if (v.size() < 4) v.push_back({ r.tex, r.srv, r.rtv });
+    }
+    void MakeResolvedTexture(Resolved& r, float scale)
     {
         D3D11_TEXTURE2D_DESC t{};
-        t.Width = AllocPx(r.pitch); t.Height = AllocPx(r.height); t.MipLevels = t.ArraySize = 1;
+        t.Width = AllocPx(r.pitch, scale); t.Height = AllocPx(r.height, scale); t.MipLevels = t.ArraySize = 1;
         t.Format = r.depth ? DXGI_FORMAT_R32_FLOAT : r.rg16f ? DXGI_FORMAT_R16G16_FLOAT : DXGI_FORMAT_B8G8R8A8_UNORM;
         t.SampleDesc.Count = 1; t.Usage = D3D11_USAGE_DEFAULT;
         t.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
         r.tex.Reset(); r.srv.Reset(); r.rtv.Reset();
-        Check(device_->CreateTexture2D(&t, nullptr, &r.tex), "CreateResolveTexture");
-        Check(device_->CreateShaderResourceView(r.tex.Get(), nullptr, &r.srv), "CreateResolveSrv");
-        Check(device_->CreateRenderTargetView(r.tex.Get(), nullptr, &r.rtv), "CreateResolveRtv");
+        auto pooled = resolvePool_.find(ResolvePoolKey(t.Width, t.Height, t.Format));
+        if (pooled != resolvePool_.end() && !pooled->second.empty())
+        {
+            PooledResolve& p = pooled->second.back();
+            r.tex = std::move(p.tex); r.srv = std::move(p.srv); r.rtv = std::move(p.rtv);
+            pooled->second.pop_back();
+            ++stats_.resolvePoolHits;
+        }
+        else
+        {
+            Check(device_->CreateTexture2D(&t, nullptr, &r.tex), "CreateResolveTexture");
+            Check(device_->CreateShaderResourceView(r.tex.Get(), nullptr, &r.srv), "CreateResolveSrv");
+            Check(device_->CreateRenderTargetView(r.tex.Get(), nullptr, &r.rtv), "CreateResolveRtv");
+            ++stats_.resolveCreates;
+        }
         const float zero[4] = { 0, 0, 0, 0 };
         context_->ClearRenderTargetView(r.rtv.Get(), zero);
-        r.scale = scale_;
+        r.scale = scale;
     }
     double SurfaceMegabytes() const
     {
@@ -1930,9 +2343,9 @@ private:
             return f == DXGI_FORMAT_R16G16B16A16_FLOAT || f == DXGI_FORMAT_R32G32_FLOAT ? 8.0 : 4.0;
         };
         double bytes = 0;
-        for (const auto& [k, c] : colors_) if (c.tex) bytes += double(AllocPx(c.extW)) * AllocPx(c.extH) * bpp(c.format);
-        for (const auto& [k, d] : depths_) if (d.tex) bytes += double(AllocPx(d.extW)) * AllocPx(d.extH) * 4.0;
-        for (const auto& [k, r] : resolved_) if (r.tex) bytes += double(AllocPx(r.pitch)) * AllocPx(r.height) * 4.0;
+        for (const auto& [k, c] : colors_) if (c.tex) bytes += double(AllocPx(c.extW, c.scale)) * AllocPx(c.extH, c.scale) * bpp(c.format);
+        for (const auto& [k, d] : depths_) if (d.tex) bytes += double(AllocPx(d.extW, d.scale)) * AllocPx(d.extH, d.scale) * 8.0;
+        for (const auto& [k, r] : resolved_) if (r.tex) bytes += double(AllocPx(r.pitch, r.scale)) * AllocPx(r.height, r.scale) * 4.0;
         return bytes / 1048576.0;
     }
 
@@ -2013,15 +2426,49 @@ private:
         return state.Get();
     }
 
+    // The stencil reference/mask register for a draw: the back-face one only when the draw
+    // can show nothing but back faces (front faces culled), as Xenia's D3D12 path picks it -
+    // D3D11, like D3D12, has one reference and one pair of masks for both faces.
+    uint32_t StencilRefMask(const DrawState& st) const
+    {
+        const bool backOnly = ((st.depthCtl >> 7) & 1) && (st.cull & 3) == 1;
+        return backOnly ? st.stencilRefMaskBf : st.stencilRefMask;
+    }
+    UINT StencilRef(const DrawState& st) const { return st.stencil ? (StencilRefMask(st) & 0xFF) : 0; }
+
+    // Xenos compare functions (never, less, equal, ...) and stencil ops (keep, zero, replace,
+    // incr-clamp, decr-clamp, invert, incr-wrap, decr-wrap) are in D3D11's order.
     ID3D11DepthStencilState* DepthState(const DrawState& st)
     {
-        const uint32_t key = (st.zEnable ? 1u : 0u) | (st.zWrite ? 2u : 0u) | (st.zFunc << 2);
+        uint64_t key = (st.zEnable ? 1u : 0u) | (st.zWrite ? 2u : 0u) | (st.zFunc << 2);
+        if (st.stencil)
+        {
+            const uint32_t masks = (StencilRefMask(st) >> 8) & 0xFFFF;          // read mask | write mask << 8
+            key |= (1ull << 5) | (uint64_t(st.depthCtl >> 7) << 6) | (uint64_t(masks) << 31);
+        }
         auto it = depthStates_.find(key);
         if (it != depthStates_.end()) return it->second.Get();
         D3D11_DEPTH_STENCIL_DESC d{};
         d.DepthEnable = st.zEnable ? TRUE : FALSE;
         d.DepthWriteMask = st.zWrite ? D3D11_DEPTH_WRITE_MASK_ALL : D3D11_DEPTH_WRITE_MASK_ZERO;
         d.DepthFunc = D3D11_COMPARISON_FUNC(D3D11_COMPARISON_NEVER + (st.zFunc & 7));
+        if (st.stencil)
+        {
+            const uint32_t c = st.depthCtl, rm = StencilRefMask(st);
+            d.StencilEnable = TRUE;
+            d.StencilReadMask = UINT8((rm >> 8) & 0xFF);
+            d.StencilWriteMask = UINT8((rm >> 16) & 0xFF);
+            auto face = [](uint32_t bits) {
+                D3D11_DEPTH_STENCILOP_DESC f{};
+                f.StencilFunc = D3D11_COMPARISON_FUNC(D3D11_COMPARISON_NEVER + (bits & 7));
+                f.StencilFailOp = D3D11_STENCIL_OP(D3D11_STENCIL_OP_KEEP + ((bits >> 3) & 7));
+                f.StencilPassOp = D3D11_STENCIL_OP(D3D11_STENCIL_OP_KEEP + ((bits >> 6) & 7));
+                f.StencilDepthFailOp = D3D11_STENCIL_OP(D3D11_STENCIL_OP_KEEP + ((bits >> 9) & 7));
+                return f;
+            };
+            d.FrontFace = face(c >> 8);
+            d.BackFace = ((c >> 7) & 1) ? face(c >> 20) : d.FrontFace;
+        }
         ComPtr<ID3D11DepthStencilState> state;
         Check(device_->CreateDepthStencilState(&d, &state), "CreateDepthStencilState");
         return (depthStates_[key] = state).Get();
@@ -2060,7 +2507,23 @@ private:
         }
     }
 
+    // The frame log (framelog.trigger) notes where each bound texture came from.
     Bound BindTexture(const uint32_t* regs, uint32_t slot, bool array = false)
+    {
+        const Bound b = BindTextureFrom(regs, slot, array);
+        if (g_gpuFrameNote)
+        {
+            const char* kind = "guest bytes";
+            if (b.srv == defaultSrv_.Get() || b.srv == defaultArraySrv_.Get()) kind = "fallback";
+            else for (const auto& [dest, r] : resolved_) if (r.srv.Get() == b.srv) { kind = r.depth ? "depth resolve" : "resolve"; break; }
+            const Texture t = DecodeTexture(regs, slot);
+            char line[160];
+            std::snprintf(line, sizeof(line), "    hw t%u: base=%08X fmt=%u %ux%u -> %s\n", slot, t.base, t.format, t.width, t.height, kind);
+            g_gpuFrameNote(line);
+        }
+        return b;
+    }
+    Bound BindTextureFrom(const uint32_t* regs, uint32_t slot, bool array)
     {
         Texture t = DecodeTexture(regs, slot);
         ID3D11ShaderResourceView* fallback = array ? defaultArraySrv_.Get() : defaultSrv_.Get();
@@ -2293,24 +2756,125 @@ private:
     // the A8R8G8B8 word 0xAARRGGBB), then accept those bytes as the entry's own. MEASURED
     // 2026-10-12: the character texture bake (CPU recompressors reading its 1024x1024 swapped
     // resolve) drew Devil Jin's red flames blue with the two orders exchanged.
+    // Start a resolve's copy to its staging texture at the logical size WriteBack reads (scaled
+    // surfaces are resampled first, as ReadLogical does). The GPU runs it in order with the rest of
+    // the frame and the flush hands it over now, so a later Map waits for this copy at most.
+    void StageReadback(Resolved& r)
+    {
+        D3D11_TEXTURE2D_DESC d{};
+        r.tex->GetDesc(&d);
+        ID3D11Texture2D* source = r.tex.Get();
+        if (d.Width != r.pitch || d.Height != r.height)
+        {
+            if (!r.logical)
+            {
+                D3D11_TEXTURE2D_DESC t{};
+                t.Width = r.pitch; t.Height = r.height; t.MipLevels = t.ArraySize = 1; t.Format = d.Format;
+                t.SampleDesc.Count = 1; t.Usage = D3D11_USAGE_DEFAULT; t.BindFlags = D3D11_BIND_RENDER_TARGET;
+                Check(device_->CreateTexture2D(&t, nullptr, &r.logical), "CreateReadbackLogical");
+                Check(device_->CreateRenderTargetView(r.logical.Get(), nullptr, &r.logicalRtv), "CreateReadbackLogicalRtv");
+            }
+            Resample(r.srv.Get(), r.logicalRtv.Get(), nullptr, r.pitch, r.height, 1.0f / float(r.pitch), 1.0f / float(r.height),
+                     !r.depth && Filterable(d.Format));
+            source = r.logical.Get();
+        }
+        if (!r.staging)
+        {
+            D3D11_TEXTURE2D_DESC s{};
+            s.Width = r.pitch; s.Height = r.height; s.MipLevels = s.ArraySize = 1; s.Format = d.Format;
+            s.SampleDesc.Count = 1; s.Usage = D3D11_USAGE_STAGING; s.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            Check(device_->CreateTexture2D(&s, nullptr, &r.staging), "CreateReadbackStaging");
+        }
+        D3D11_BOX box{ 0, 0, 0, r.pitch, r.height, 1 };
+        context_->CopySubresourceRegion(r.staging.Get(), 0, 0, 0, 0, source, 0, &box);
+        if (readbackFence_) context4_->Signal(readbackFence_.Get(), r.stagedFence = ++readbackFenceValue_);
+        Probe("staged copy");
+        context_->Flush();
+        r.staged = true;
+        r.stagedSeq = r.seq;
+        r.stagedAt = std::chrono::steady_clock::now();
+        ++stats_.stagedReadbacks;
+    }
+
+    // Small resolves staged for the CPU (the exposure readback): into guest memory as soon as the
+    // GPU has done their copy - never waiting for it.
+    std::unordered_set<uint32_t> smallPending_;
+    void FinishSmallWritebacks()
+    {
+        for (auto it = smallPending_.begin(); it != smallPending_.end();)
+        {
+            auto f = resolved_.find(*it);
+            if (f == resolved_.end() || !f->second.valid || !f->second.staged || f->second.stagedSeq != f->second.seq)
+            {
+                it = smallPending_.erase(it);
+                continue;
+            }
+            Resolved& r = f->second;
+            if (readbackFence_ && readbackFence_->GetCompletedValue() < r.stagedFence) { ++it; continue; }
+            std::vector<uint32_t> px;
+            if (!ReadStaging(r.staging.Get(), r.pitch, r.height, px, true)) { ++it; continue; }
+            r.staged = false;
+            Scatter(*it, r, px, 0);
+            it = smallPending_.erase(it);
+        }
+    }
+
+    // A resolve back into guest memory now, waiting for the GPU (TTT2_GPU_HW_WRITEBACK=1, and the
+    // small ones with TTT2_SMALL_WRITEBACK_SYNC=1).
     void WriteBack(uint32_t dest, Resolved& r)
     {
+        const auto t0 = std::chrono::steady_clock::now();
         std::vector<uint32_t> px;
-        ReadLogical(r.tex.Get(), r.pitch, r.height, r.pitch, r.height, !r.depth, px);
+        if (r.staged && r.stagedSeq == r.seq) ReadStaging(r.staging.Get(), r.pitch, r.height, px, false);   // copied at resolve time
+        else ReadLogical(r.tex.Get(), r.pitch, r.height, r.pitch, r.height, !r.depth, px);
+        r.staged = false;
+        Scatter(dest, r, px, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    }
+
+    // The logical-size pixels `px` of resolve `r` into guest memory (tiled, in the guest's byte and
+    // channel order); the resolve is CPU-coherent from now on.
+    void Scatter(uint32_t dest, Resolved& r, const std::vector<uint32_t>& px, double readMs)
+    {
+        using clock = std::chrono::steady_clock;
+        const auto t1 = clock::now();
         const uint32_t aligned = (r.pitch + 31) & ~31u;
-        for (uint32_t y = 0; y < r.height; ++y)
-            for (uint32_t x = 0; x < r.pitch; ++x)
-            {
-                uint32_t v = px[size_t(y) * r.pitch + x];
-                if (r.depth) v = DepthWord(v, r.depthFloat);
-                else if (r.rg16f) {}       // R16G16_FLOAT texel = red half | green half << 16, as fetched
-                else if (!r.swapRB) v = (v & 0xFF00FF00u) | ((v >> 16) & 0xFFu) | ((v & 0xFFu) << 16);
-                GWrite32(g_base, dest + GpuTiledOffset2D(x, y, aligned, 2) * 4, v);
-            }
+        auto rows = [&](uint32_t y0, uint32_t y1) {
+            for (uint32_t y = y0; y < y1; ++y)
+                for (uint32_t x = 0; x < r.pitch; ++x)
+                {
+                    uint32_t v = px[size_t(y) * r.pitch + x];
+                    if (r.depth) v = DepthWord(v, r.depthFloat);
+                    else if (r.rg16f) {}       // R16G16_FLOAT texel = red half | green half << 16, as fetched
+                    else if (!r.swapRB) v = (v & 0xFF00FF00u) | ((v >> 16) & 0xFFu) | ((v & 0xFFu) << 16);
+                    GWrite32(g_base, dest + GpuTiledOffset2D(x, y, aligned, 2) * 4, v);
+                }
+        };
+        // Large ones (the fight intro's 1024x1024 character texture bakes, ~2 ms each with a game
+        // thread waiting) in four bands at once: every texel has its own guest address.
+        if (size_t(r.pitch) * r.height >= 256 * 1024 && r.height >= 64)
+        {
+            const uint32_t band = ((r.height + 3) / 4 + 31) & ~31u;    // 4 bands cover every row
+            std::thread helpers[3];
+            for (uint32_t i = 0; i < 3; ++i)
+                helpers[i] = std::thread(rows, std::min(r.height, band * (i + 1)), std::min(r.height, band * (i + 2)));
+            rows(0, std::min(r.height, band));
+            for (auto& t : helpers) t.join();
+        }
+        else rows(0, r.height);
         dirty_.Sync(dest, r.size);
         r.seq = dirty_.Current();
         r.cpuCoherent = true;
         ++stats_.writebacks;
+        static const bool timing = [] { const char* e = std::getenv("TTT2_FRAMETIME"); return e && *e == '1'; }();
+        if (timing && r.pitch * r.height > 64)
+        {
+            static int logged = 0;
+            const auto t2 = clock::now();
+            if (logged++ < 200)
+                std::fprintf(stderr, "[frame] writeback %08X %ux%u: read %.2f ms (map wait %.2f ms), scatter %.2f ms, copy queued %.2f ms before\n",
+                             dest, r.pitch, r.height, readMs, lastMapWaitMs_, std::chrono::duration<double, std::milli>(t2 - t1).count(),
+                             lastStagedAgeMs_);
+        }
         if (CensusOn() && r.pitch * r.height <= 64)
         {
             // Diagnostics: small resolves the CPU reads back (exposure / luminance readbacks):
@@ -2321,6 +2885,23 @@ private:
                              dest, r.pitch, r.height, int(r.swapRB), GRead32(g_base, dest), GRead32(g_base, dest + 4),
                              GRead32(g_base, dest + 8), GRead32(g_base, dest + 12), seen[dest]);
         }
+    }
+
+    // A staged readback (StageReadback): map the staging texture, its copy already queued. With
+    // `noWait`, false (nothing read) while the GPU has not finished the copy yet.
+    bool ReadStaging(ID3D11Texture2D* staging, uint32_t width, uint32_t height, std::vector<uint32_t>& out, bool noWait)
+    {
+        D3D11_MAPPED_SUBRESOURCE m{};
+        const auto mapStart = std::chrono::steady_clock::now();
+        const HRESULT hr = context_->Map(staging, 0, D3D11_MAP_READ, noWait ? D3D11_MAP_FLAG_DO_NOT_WAIT : 0, &m);
+        if (noWait && hr == DXGI_ERROR_WAS_STILL_DRAWING) return false;
+        Check(hr, "MapReadbackStaging");
+        lastMapWaitMs_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - mapStart).count();
+        out.resize(size_t(width) * height);
+        for (uint32_t y = 0; y < height; ++y)
+            std::memcpy(&out[size_t(y) * width], static_cast<const uint8_t*>(m.pData) + size_t(y) * m.RowPitch, width * 4);
+        context_->Unmap(staging, 0);
+        return true;
     }
 
     void ReadTexture(ID3D11Texture2D* tex, uint32_t width, uint32_t height, std::vector<uint32_t>& out)
@@ -2334,7 +2915,9 @@ private:
         D3D11_BOX box{ 0, 0, 0, width, height, 1 };
         context_->CopySubresourceRegion(staging.Get(), 0, 0, 0, 0, tex, 0, &box);
         D3D11_MAPPED_SUBRESOURCE m{};
+        const auto mapStart = std::chrono::steady_clock::now();
         Check(context_->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &m), "MapStaging");
+        lastMapWaitMs_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - mapStart).count();
         out.resize(size_t(width) * height);
         for (uint32_t y = 0; y < height; ++y)
             std::memcpy(&out[size_t(y) * width], static_cast<const uint8_t*>(m.pData) + size_t(y) * m.RowPitch, width * 4);
@@ -2436,18 +3019,35 @@ private:
                        stats_.depthResolves - reported_.depthResolves, stats_.depthHits - reported_.depthHits,
                        stats_.gpuVsDraws - reported_.gpuVsDraws, stats_.vertexDataBytes - reported_.vertexDataBytes };
         const uint64_t warmHits = stats_.warmHits - reported_.warmHits, pendingSkips = stats_.pendingSkips - reported_.pendingSkips;
+        const uint64_t staged = stats_.stagedReadbacks - reported_.stagedReadbacks;
+        const uint64_t ringWaits = stats_.ringWaits - reported_.ringWaits;
+        const double ringWaitMs = stats_.ringWaitMs - reported_.ringWaitMs;
+        const uint64_t resolveCreates = stats_.resolveCreates - reported_.resolveCreates;
+        const uint64_t resolvePoolHits = stats_.resolvePoolHits - reported_.resolvePoolHits;
         reported_ = stats_;
         std::fprintf(stderr,
             "[gpu-hw] %.1fs: draws=%llu tris=%llu skipped=%llu empty=%llu resolves=%llu presents=%llu (%.1f/s) "
-            "ps_compiles=%llu ps_disk=%llu shader_warm=%llu shader_pending_skips=%llu tex_uploads=%llu (%.1f MB) resolved_hits=%llu writebacks=%llu "
-            "depth_resolves=%llu depth_hits=%llu shaders=%zu textures=%zu gpu_vs_draws=%llu (%.1f MB vertex data, %zu vs)\n",
+            "ps_compiles=%llu ps_disk=%llu shader_warm=%llu shader_pending_skips=%llu tex_uploads=%llu (%.1f MB) resolved_hits=%llu writebacks=%llu (staged %llu) "
+            "depth_resolves=%llu depth_hits=%llu shaders=%zu textures=%zu gpu_vs_draws=%llu (%.1f MB vertex data, %zu vs) ring_waits=%llu (%.1f ms) resolve_textures=%llu new %llu reused\n",
             s, (unsigned long long)d.draws, (unsigned long long)d.triangles, (unsigned long long)d.skippedDraws,
             (unsigned long long)d.emptyDraws, (unsigned long long)d.resolves, (unsigned long long)d.presents,
             double(d.presents) / s, (unsigned long long)d.compiles, (unsigned long long)d.diskHits, (unsigned long long)warmHits, (unsigned long long)pendingSkips,
             (unsigned long long)d.uploads, double(d.uploadBytes) / 1048576.0, (unsigned long long)d.resolvedHits,
-            (unsigned long long)d.writebacks, (unsigned long long)d.depthResolves, (unsigned long long)d.depthHits,
+            (unsigned long long)d.writebacks, (unsigned long long)staged, (unsigned long long)d.depthResolves, (unsigned long long)d.depthHits,
             pixelShaders_.size(), textures_.size(), (unsigned long long)d.gpuVsDraws,
-            double(d.vertexDataBytes) / 1048576.0, vertexShaders_.size());
+            double(d.vertexDataBytes) / 1048576.0, vertexShaders_.size(), (unsigned long long)ringWaits, ringWaitMs,
+            (unsigned long long)resolveCreates, (unsigned long long)resolvePoolHits);
+        if (CallCountOn())
+        {
+            std::map<std::string, uint64_t> counts;
+            {
+                std::lock_guard l(g_callCountMutex);
+                counts.swap(g_callCounts);
+            }
+            std::string line = "[gpu-hw]   d3d calls:";
+            for (const auto& [label, n] : counts) line += " " + label + "=" + std::to_string(n);
+            std::fprintf(stderr, "%s\n", line.c_str());
+        }
         if (!uploadByFormat_.empty())
         {
             char line[512]; int n = std::snprintf(line, sizeof(line), "[gpu-hw]   uploads by format:");

@@ -166,6 +166,11 @@ public:
 private:
     void Initialize()
     {
+        if (const char* e = std::getenv("TTT2_AUDIO_SILENT"); e && *e == '1')
+        {
+            std::fprintf(stderr, "[snd-output] TTT2_AUDIO_SILENT=1: no XAudio2, silent callback pacing\n");
+            return;                                     // diagnostics: no audio device at all
+        }
         HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         const char* operation = "CoInitializeEx";
         if (SUCCEEDED(hr)) { operation = "XAudio2Create"; hr = XAudio2Create(&audio_); }

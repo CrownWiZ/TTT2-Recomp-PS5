@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <string>
 
@@ -23,6 +24,7 @@ std::atomic<uint32_t> g_generation{ 0 };
 
 std::string IniPath()
 {
+    if (const char* e = std::getenv("TTT2_SETTINGS_INI"); e && *e) return e;   // test runs
     char dir[MAX_PATH];
     const DWORD n = GetEnvironmentVariableA("LOCALAPPDATA", dir, sizeof(dir));
     std::string path = (n && n < sizeof(dir)) ? std::string(dir) : std::string(".");
