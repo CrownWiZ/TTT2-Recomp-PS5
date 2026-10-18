@@ -166,6 +166,10 @@ new key. `LB` / `RB` show the movement, START and BACK keys, plus `DEFAULTS` to 
 
 Display mode and resolution are in the game's own menu: `OPTIONS` → `DISPLAY SETTINGS`.
 
+**Input delay:** the original game adds 2 frames of delay to every button press in offline modes.
+This port removes them by default; turn them back on in `OPTIONS` → `GAME OPTIONS` → `INPUT DELAY`.
+Online matches always use the game's own delay, the same for both players.
+
 ---
 
 ## Questions

@@ -714,6 +714,9 @@ void Report(const char* header, const std::vector<Sample>& samples, size_t guest
 
 // Mode 3 hooks for kernel_video.cpp: the command-processor thread registers itself, and the
 // present timer reports frames over 25 ms.
+// data_watch.cpp: the guest context a host thread is running (its LR names the guest caller).
+PPCContext* WatchGuestContextOf(DWORD tid) { return hitch::GuestContextOf(tid); }
+
 void HitchRegisterThread(const char* name)
 {
     if (hitch::Mode() == 3 || (hitch::Mode() == 4 && std::strcmp(name, "cp") == 0)) hitch::Register(name, nullptr);

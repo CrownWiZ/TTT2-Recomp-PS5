@@ -340,6 +340,17 @@ uint32_t ArbitrationRegister(uint8_t* base, uint32_t b)
 
 } // namespace
 
+// True while the game has an online session (created, not deleted): Player / Ranked Match
+// lobbies and their matches. input_delay.cpp keeps the game's own input delay then - both
+// sides of an online match must use the same one.
+bool XSessionAnyActive()
+{
+    std::lock_guard l(g_mutex);
+    for (const auto& [handle, s] : g_sessions)
+        if (s.created && s.state != State::Deleted) return true;
+    return false;
+}
+
 // ---- session handles ------------------------------------------------------------------------------
 PPC_FUNC(__imp__XamSessionCreateHandle)
 {

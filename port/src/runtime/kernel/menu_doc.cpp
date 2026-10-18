@@ -319,6 +319,7 @@ void XtalAppendIconRow(std::string& blob, uint8_t lastSmall, uint8_t large, cons
 void AddSystemFrames(Doc& d);
 void AddSwitchProfile(Doc& d);
 void AddKeyboardMode(Doc& d);
+void AddInputDelay(Doc& d);
 
 void Edit(Doc& d, const PcLists& lists, std::string* note)
 {
@@ -435,6 +436,47 @@ void Edit(Doc& d, const PcLists& lists, std::string* note)
     Doc keyboard = d;
     try { AddKeyboardMode(keyboard); d = std::move(keyboard); }
     catch (const Fail& e) { if (note) *note = std::string("Controller Setup KEYBOARD mode left out: ") + e.what(); }
+    // So does INPUT DELAY.
+    Doc inputDelay = d;
+    try { AddInputDelay(inputDelay); d = std::move(inputDelay); }
+    catch (const Fail& e) { if (note) *note += std::string(note->empty() ? "" : "; ") + "Game Options INPUT DELAY left out: " + e.what(); }
+}
+
+// ---- Options -> Game Options: INPUT DELAY (OFF / ON) before DEFAULT - the game's 2-frame offline
+// input delay (input_delay.cpp). The row is a copy of GUARD DAMAGE (OFF / ON, the game's own text
+// ids, no script of its own): like GUARD DAMAGE and BATTLE POSITION it is read when the page opens
+// and stored when it closes, through menu_ext.cpp's hooks of BATTLE POSITION's cursor and setter.
+// The page's icon arrays already hold 7 entries (MEASURED 2026-10-18), so 7 rows need no script edit.
+void AddInputDelay(Doc& d)
+{
+    Node row = d.Find("MenuItemMode007-01-04");
+    d.Set(row, "name", "MenuItemMode007-01-07");
+    d.Set(row, "text", "INPUT DELAY");
+    d.Set(row, "textid", nullptr);
+    d.Set(row, "textid360", nullptr);
+    d.Set(row, "value", "SelectValueMenuItemMode007-01-07");
+    {
+        size_t at = 0;
+        std::vector<Node>& items = d.ListOf("MenuItemMode007-01-06", at);
+        items.insert(items.begin() + std::ptrdiff_t(at), std::move(row));
+    }
+    // Its value list right after BATTLE POSITION's (value columns follow document order).
+    Node sv = d.Find("SelectValueMenuItemMode007-01-04");
+    d.Set(sv, "name", "SelectValueMenuItemMode007-01-07");
+    {
+        size_t at = 0;
+        std::vector<Node>& list = d.ListOf("SelectValueMenuItemMode007-01-05", at);
+        list.insert(list.begin() + std::ptrdiff_t(at) + 1, std::move(sv));
+    }
+    // Help texts go by position: the new row is the 6th, DEFAULT's moves to 7.
+    size_t at = 0;
+    std::vector<Node>& list = d.ListOf("StaticMode007-01-06", at);
+    Node help = list[at];
+    d.Set(help, "text", "Turn the original 2-frame input delay in offline modes on or off.");
+    d.Set(help, "textid", nullptr);
+    d.Set(help, "textid360", nullptr);
+    d.Set(list[at], "name", "StaticMode007-01-07");
+    list.insert(list.begin() + std::ptrdiff_t(at), std::move(help));
 }
 
 // ---- Options -> Controller Setup: KEYBOARD mode (KEYBOARD_PLAN.md). The screen's artwork has room

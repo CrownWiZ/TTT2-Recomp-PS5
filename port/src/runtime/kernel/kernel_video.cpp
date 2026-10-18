@@ -427,10 +427,51 @@ static uint32_t* GammaRamp()
 }
 static void GammaRegisterWritten(uint32_t reg, uint32_t value);
 
+// TTT2_INPUT_TIMING=1: input latency tests log every game swap and present (same clock as the
+// [input] / [burst] lines).
+static bool InputTimingOn()
+{
+    static const bool on = [] { const char* e = std::getenv("TTT2_INPUT_TIMING"); return e && *e == '1'; }();
+    return on;
+}
+
+static bool EarlyPresentOn()
+{
+    static const bool on = [] { const char* e = std::getenv("TTT2_EARLY_PRESENT"); return !(e && *e == '0'); }();
+    return on;
+}
+// Early present: VdSwap numbers the swaps it writes a marker for and records each one's front
+// buffer; the CP counts the markers it executes, so the frame a vblank-token wait belongs to is
+// known (see the WAIT_REG_MEM packet).
+std::atomic<uint32_t> g_markerSwaps{ 0 };               // markers written (VdSwap, main thread)
+std::atomic<uint32_t> g_markerFb[16];                   // their front buffer surfaces, by number
+static uint32_t g_cpMarkers = 0;                        // markers executed (CP thread)
+static uint32_t g_earlySwap = 0;                        // the marker number presented early (CP)
+static bool g_earlyBroken = false;                      // a marker did not match: early present off
+// The game's swap: wait for the vblank token (the previous flip done), resolve the frame from EDRAM
+// into the front buffer, marker. Early present does that resolve itself when the wait starts, with
+// the arguments of the previous frame's front resolve; the game's own repeats it after the wait.
+struct FrontResolveArgs
+{
+    uint32_t key = 0, dest = 0, pitch = 0, height = 0, latch = 0, src = 0, depthBase = 0, format = 0;
+    bool hasLatch = false, swap = false, depthFloat = false;
+    bool operator==(const FrontResolveArgs& o) const
+    {
+        return key == o.key && dest == o.dest && pitch == o.pitch && height == o.height && latch == o.latch && src == o.src &&
+               depthBase == o.depthBase && format == o.format && hasLatch == o.hasLatch && swap == o.swap && depthFloat == o.depthFloat;
+    }
+};
+static FrontResolveArgs g_frontArgs, g_earlyArgs;       // CP: the last front resolve / the early one
+static uint32_t g_frontArgsAt = ~0u;                    // markers executed when the last one ran
+static bool g_earlyMismatch = false;                    // this frame's own differed: present at its marker
+
 static void HwPresentFrame(uint32_t fb)
 {
     g_cpPresents.fetch_add(1, std::memory_order_relaxed);
     const auto presentStart = std::chrono::steady_clock::now();
+    if (InputTimingOn())
+        std::fprintf(stderr, "[present] #%u at %.1f ms\n", g_cpPresents.load(),
+                     std::chrono::duration<double, std::milli>(presentStart.time_since_epoch()).count());
     static uint32_t ramp[256], rampVersion = ~0u;
     if (const uint32_t v = g_gammaVersion.load(); v != rampVersion)
     {
@@ -489,7 +530,11 @@ static void HwPresentFrame(uint32_t fb)
                 char fp[128];
                 if (burst)
                 {
-                    BoundedSnprintf(fp, sizeof(fp), "C:/ttt2/port/fb/burst_%04u.bmp", burstIndex++);
+                    BoundedSnprintf(fp, sizeof(fp), "C:/ttt2/port/fb/burst_%04u.bmp", burstIndex);
+                    // When this frame was presented (input latency tests: compare with the
+                    // "[input] buttons ... visible" line, same clock).
+                    std::fprintf(stderr, "[burst] %04u at %.1f ms\n", burstIndex++,
+                                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count());
                     --burstLeft;
                 }
                 else BoundedSnprintf(fp, sizeof(fp), "C:/ttt2/port/fb/frame_%04u.bmp", frames / (uint32_t)seqEvery);
@@ -909,10 +954,20 @@ static void IssueResolve()
         // copy_src_select 4 resolves DEPTH (TTT2's shadow map and scene depth, sampled as
         // 24_8_FLOAT); the CPU path below still copies colour for it (documented divergence).
         auto latch = g_edramClear.find(colorBase);
-        GpuHwResolve(hwColorKey, destBase, pitch, height, latch != g_edramClear.end(),
-                     latch != g_edramClear.end() ? latch->second : 0, ((destInfo >> 24) & 1) != 0,
-                     ctrl & 7u, g_regFile[0x2002] & 0xFFFu, ((g_regFile[0x2002] >> 16) & 1u) != 0,
-                     (destInfo >> 7) & 0x3Fu);
+        FrontResolveArgs args;
+        args.key = hwColorKey; args.dest = destBase; args.pitch = pitch; args.height = height;
+        args.hasLatch = latch != g_edramClear.end(); args.latch = args.hasLatch ? latch->second : 0;
+        args.swap = ((destInfo >> 24) & 1) != 0; args.src = ctrl & 7u;
+        args.depthBase = g_regFile[0x2002] & 0xFFFu; args.depthFloat = ((g_regFile[0x2002] >> 16) & 1u) != 0;
+        args.format = (destInfo >> 7) & 0x3Fu;
+        GpuHwResolve(args.key, args.dest, args.pitch, args.height, args.hasLatch, args.latch, args.swap,
+                     args.src, args.depthBase, args.depthFloat, args.format);
+        if (destBase == g_frontBufferPhys.load())
+        {
+            if (g_earlySwap == g_cpMarkers + 1 && !(args == g_earlyArgs)) g_earlyMismatch = true;
+            g_frontArgs = args;
+            g_frontArgsAt = g_cpMarkers;
+        }
         if (traceDumpDest == destBase)
         {
             static uint32_t traceDumps = 0;
@@ -1241,6 +1296,33 @@ struct CpWaitClock
     }
 };
 
+// The game's swap sequence (VdSwap: an indirect buffer, then our marker) waits for the next vblank
+// on SCRATCH_REG1 (the vblank token: the previous flip done), then resolves frame N from EDRAM into
+// the front buffer: frame N is drawn when that wait starts. Resolve and present it then instead of
+// at its marker after the wait - MEASURED 2026-10-18: the wait lasted 7-8 ms every frame (the
+// console's flip at vblank), half a frame of input latency. The game's own resolve repeats the copy
+// and the flip bookkeeping still runs at the marker. Called when the wait starts and again while it
+// waits (the marker can be written a moment after the CP gets there; VdSwap wakes the wait).
+// Only while the previous frame resolved into this front buffer the same way. TTT2_EARLY_PRESENT=0:
+// present at the markers as before.
+static void TryEarlyPresent(uint32_t waitInfo, uint32_t pollOn)
+{
+    const uint32_t pending = g_cpMarkers + 1;
+    if (!EarlyPresentOn() || g_earlyBroken || !GpuHwMode() || !(waitInfo & 0x10) || (pollOn & ~3u) != g_regFile[0x01DD] + 4 ||
+        g_earlySwap == pending || pending > g_markerSwaps.load())
+        return;
+    const uint32_t fbSurf = g_markerFb[pending & 15].load();
+    if (!fbSurf || g_frontArgsAt + 1 != g_cpMarkers || g_frontArgs.dest != (fbSurf & ~0xFFFu)) return;
+    const FrontResolveArgs& a = g_frontArgs;
+    GpuHwResolve(a.key, a.dest, a.pitch, a.height, a.hasLatch, a.latch, a.swap, a.src, a.depthBase, a.depthFloat, a.format);
+    g_earlyArgs = a;
+    g_earlyMismatch = false;
+    g_frontBufferPhys.store(fbSurf & ~0xFFFu);
+    g_frontBufferSwizzle.store(fbSurf & 0xFFFu);
+    HwPresentFrame(g_frontBufferPhys.load());
+    g_earlySwap = pending;
+}
+
 static bool CpWaitYield()
 {
     static const bool yield = [] { const char* e = std::getenv("TTT2_CP_WAIT"); return e && std::strcmp(e, "yield") == 0; }();
@@ -1268,6 +1350,17 @@ static void CpWaitLateWake(uint32_t pollOn)
 // Wait until (value & mask) <func> ref, polling guest memory or the register file.
 static bool WaitRegMem(uint32_t waitInfo, uint32_t pollOn, uint32_t ref, uint32_t mask)
 {
+    struct TimingMark                                   // TTT2_INPUT_TIMING=1: the wait's span
+    {
+        uint32_t poll;
+        double start = InputTimingOn() ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count() : 0;
+        ~TimingMark()
+        {
+            if (InputTimingOn())
+                std::fprintf(stderr, "[cpwait] %08X from %.1f ms at %.1f ms\n", poll, start,
+                             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count());
+        }
+    } timingMark{ pollOn };
     const CpWaitClock waitClock{ (waitInfo & 0x10) ? (pollOn < 0x1000 ? 0 : 1) : 2, pollOn };
     const timeline::Scope waitMark{ timeline::CpVblankWait, pollOn };
     bool memSpace = (waitInfo & 0x10) != 0;
@@ -1302,6 +1395,7 @@ static bool WaitRegMem(uint32_t waitInfo, uint32_t pollOn, uint32_t ref, uint32_
     for (uint64_t spins = 0;; ++spins)
     {
         const uint32_t progress = g_gpuProgress.load(std::memory_order_acquire);
+        if (memSpace) TryEarlyPresent(waitInfo, pollOn);
         if (memSpace) SyncGuestScratchWrites();
         uint32_t v;
         if (memSpace && pollOn < 0x1000)
@@ -1504,7 +1598,16 @@ static void ExecPacketStream(uint32_t addr, uint32_t sizeBytes, int depth)
                 g_frontBufferPhys.store(fbSurf & ~0xFFFu);
                 g_frontBufferSwizzle.store(fbSurf & 0xFFFu);
             }
-            if (GpuHwMode()) HwPresentFrame(g_frontBufferPhys.load());
+            ++g_cpMarkers;
+            const bool early = g_earlySwap && g_earlySwap == g_cpMarkers && !g_earlyMismatch;
+            g_earlyMismatch = false;
+            if (early && !g_earlyBroken && g_markerFb[g_cpMarkers & 15].load() != fbSurf)
+            {
+                g_earlyBroken = true;                            // numbering lost: present at markers
+                std::fprintf(stderr, "[vd] early present off: marker %u surface %08X, recorded %08X\n",
+                             g_cpMarkers, fbSurf, g_markerFb[g_cpMarkers & 15].load());
+            }
+            if (GpuHwMode() && !early) HwPresentFrame(g_frontBufferPhys.load());
             FrameLogSwap();
             PhysMirrorInvalidateAll();                           // frame boundary
             static int slog = 0;
@@ -1765,6 +1868,7 @@ static void ExecPacketStream(uint32_t addr, uint32_t sizeBytes, int depth)
             }
             else if (op == 0x3C && cnt >= 5)                     // WAIT_REG_MEM
             {
+                TryEarlyPresent(GRead32(g_base, addr), GRead32(g_base, addr + 4));
                 if (WaitRegMem(GRead32(g_base, addr), GRead32(g_base, addr + 4),
                                GRead32(g_base, addr + 8), GRead32(g_base, addr + 12)))
             {
@@ -2426,6 +2530,9 @@ PPC_FUNC(__imp__VdSwap)
 {
     KTrace("VdSwap");
     g_gameSwaps.fetch_add(1, std::memory_order_relaxed);
+    if (InputTimingOn())
+        std::fprintf(stderr, "[swap] #%u at %.1f ms\n", uint32_t(g_gameSwaps.load()),
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count());
     timeline::Mark(timeline::Swap, '.', uint32_t(g_gameSwaps.load()));
     if (FrameTimeLog())
     {
@@ -2457,8 +2564,13 @@ PPC_FUNC(__imp__VdSwap)
         // The fetch block lives on the CALLER'S STACK, so it is gone by the time the CP
         // executes this packet (it decoded a stale/zero surface and pointed the window at
         // the wrong memory). Decode it here, while it is still valid, and carry the result.
-        GWrite32(base, p + 16, DecodeFrontBuffer(ctx.r4.u32));
+        const uint32_t surface = DecodeFrontBuffer(ctx.r4.u32);
+        GWrite32(base, p + 16, surface);
         for (int i = 5; i < 64; ++i) GWrite32(base, p + i * 4, 0x80000000u);
+        const uint32_t n = g_markerSwaps.load() + 1;
+        g_markerFb[n & 15].store(surface);
+        g_markerSwaps.store(n);
+        GpuProgress();                                  // a CP waiting for the vblank can present it now
     }
     // Port UI actions on the game's main thread, once per frame (menu_ext.cpp: the in-game
     // profile / message-box screens). The guest's registers are restored afterwards.

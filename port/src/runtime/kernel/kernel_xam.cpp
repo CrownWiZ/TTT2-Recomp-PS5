@@ -486,8 +486,9 @@ PPC_FUNC(__imp__ExRegisterTitleTerminateNotification)
 // IMPORTANT: the guest polls input from inside a critical section its main loop also
 // takes, and host XInputGetState/GetCapabilities on DISCONNECTED pads can each take
 // hundreds of ms (driver enumeration) - calling them inline throttled the entire game
-// loop to ~0.5 Hz. A host poll thread keeps a snapshot (connected pads every ~8 ms,
-// disconnected retried every ~2 s per XInput guidance); guest calls read it instantly.
+// loop to ~0.5 Hz. A host poll thread keeps a snapshot (connected pads and the keyboard every
+// ~1 ms - a press reaches the game at most ~1 ms later than it could, it was 8 ms; disconnected
+// pads retried every 2 s per XInput guidance); guest calls read it instantly.
 #pragma comment(lib, "xinput9_1_0.lib")
 
 namespace {
@@ -542,7 +543,9 @@ static KeyboardPad ReadKeyboardPad()
 struct PadPollState
 {
     bool physicalConnected[4]{};
-    unsigned disconnectedBackoff[4]{};
+    uint64_t retryAtMs[4]{};                  // disconnected: next XInput probe (poll thread clock)
+    XINPUT_CAPABILITIES caps[4]{};            // connected: capabilities, refreshed once a second
+    uint64_t capsAtMs[4]{};
     bool keyboardEverPressed = false;
     // Host pad -> guest user, -1 until the pad is first used. A pad claims the lowest user no
     // other claimed pad holds on its first button or trigger press (sticks drift, so they do
@@ -691,6 +694,14 @@ void PollPadsOnce(PadPollState& polling, bool autoStart, uint64_t elapsedMs, Pad
     // Scripted presses join the keyboard's (controller 0, foreground not required).
     const KeyboardPad keyboard = ReadKeyboardPad();
     const uint16_t keyboardButtons = keyboard.buttons | (script ? ScriptButtons(*script, elapsedMs) : 0);
+    {
+        // Input latency tests: when player 1's buttons change, on the [burst] lines' clock.
+        static uint16_t shown = 0;
+        if (keyboardButtons != shown && script && script->active)
+            std::fprintf(stderr, "[input] buttons %04X visible at %.1f ms\n", keyboardButtons,
+                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count());
+        shown = keyboardButtons;
+    }
     const uint16_t player2Buttons = script ? ScriptButtons(*script, elapsedMs, 1) : 0;
     if (script && script->active) autoStart = true;        // keep pad 0 connected for the script
     polling.keyboardEverPressed |= keyboardButtons != 0 || keyboard.leftTrigger || keyboard.rightTrigger;
@@ -700,20 +711,24 @@ void PollPadsOnce(PadPollState& polling, bool autoStart, uint64_t elapsedMs, Pad
     {
         // Sampling depends only on the physical device, never on a synthesized
         // keyboard pad's published connection flag. Probe slot 0 on startup too.
-        if (polling.physicalConnected[i] || polling.disconnectedBackoff[i] == 0)
+        if (polling.physicalConnected[i] || elapsedMs >= polling.retryAtMs[i])
         {
             if (XInputGetState(i, &sampled[i]) == ERROR_SUCCESS)
             {
-                XInputGetCapabilities(i, 0, &hostCaps[i]);
+                if (!polling.physicalConnected[i] || elapsedMs >= polling.capsAtMs[i])
+                {
+                    XInputGetCapabilities(i, 0, &polling.caps[i]);
+                    polling.capsAtMs[i] = elapsedMs + 1000;
+                }
+                hostCaps[i] = polling.caps[i];
                 polling.physicalConnected[i] = true;
-                polling.disconnectedBackoff[i] = 0;
+                polling.retryAtMs[i] = 0;
                 continue;
             }
             sampled[i] = {};
             polling.physicalConnected[i] = false;
-            polling.disconnectedBackoff[i] = 250; // retry physical discovery in ~2 s
+            polling.retryAtMs[i] = elapsedMs + 2000; // retry physical discovery in 2 s
         }
-        else --polling.disconnectedBackoff[i];
     }
 
     auto claimed = [&](int user) {
@@ -805,7 +820,7 @@ void PadPollThread()
         const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - started).count();
         PollPadsOnce(polling, autoStart, uint64_t(elapsed), &script);
-        std::this_thread::sleep_for(std::chrono::milliseconds(8));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 }
 
@@ -921,6 +936,16 @@ PPC_FUNC(__imp__XamInputGetState)
     {
         st.Gamepad.wButtons |= 0x0010;
         st.dwPacketNumber += 0x10000;           // a new packet while the pulse lasts
+    }
+    if (user == 0)
+    {
+        // Input latency tests: the first read that returns new buttons (same clock as [burst]).
+        static uint16_t lastRead = 0;
+        static const bool timing = [] { const char* e = std::getenv("TTT2_INPUT_TIMING"); return e && *e == '1'; }();
+        if (timing && st.Gamepad.wButtons != lastRead)
+            std::fprintf(stderr, "[input] game read %04X at %.1f ms\n", st.Gamepad.wButtons,
+                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count());
+        lastRead = st.Gamepad.wButtons;
     }
     GWrite32(base, out + 0, st.dwPacketNumber);
     GWrite16(base, out + 4, st.Gamepad.wButtons);

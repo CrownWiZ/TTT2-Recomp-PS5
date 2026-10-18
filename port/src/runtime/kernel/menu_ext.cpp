@@ -44,6 +44,8 @@ extern "C" PPC_FUNC(__imp__sub_8241E7A8);
 extern "C" PPC_FUNC(__imp__sub_82623858);
 extern "C" PPC_FUNC(__imp__sub_8241B9D0);
 extern "C" PPC_FUNC(__imp__sub_8256C708);
+extern "C" PPC_FUNC(__imp__sub_82374700);
+extern "C" PPC_FUNC(__imp__sub_823747C0);
 extern void (*g_uiFrameHook)(PPCContext& ctx, uint8_t* base);
 void XamNotifyEnqueueEvent(uint32_t id, uint32_t param);
 
@@ -1177,22 +1179,54 @@ PPC_FUNC(sub_823756A8)
 }
 
 // lib::MenuSelectValueSetCursor(cursor, name): when Display Settings initialises MOTION BLUR's
-// value (on open and on DEFAULT), the PC rows get their current values (cursor at widget+368).
+// value (on open and on DEFAULT), the PC rows get their current values (cursor at widget+368); when
+// Game Options initialises BATTLE POSITION's, INPUT DELAY gets its own (OFF = 0, ON = 1).
 PPC_FUNC(sub_8256CD28)
 {
     const uint32_t nameAddr = ctx.r4.u32;
     __imp__sub_8256CD28(ctx, base);
-    if (GuestString(base, nameAddr, 64) != "SelectValueMenuItemMode007-04-02") return;
+    const std::string name = GuestString(base, nameAddr, 64);
+    const bool display = name == "SelectValueMenuItemMode007-04-02", game = name == "SelectValueMenuItemMode007-01-05";
+    if (!display && !game) return;
     const PPCContext saved = ctx;
     {
         GuestFrame frame(ctx, base, 0x100);
         static const uint32_t modeName = GuestCString(base, "SelectValueMenuItemMode007-04-06");
         static const uint32_t resName = GuestCString(base, "SelectValueMenuItemMode007-04-07");
-        if (const uint32_t w = FindWidget(ctx, base, modeName)) GWrite32(base, w + 368, uint32_t(display_settings::GetMode()));
-        if (const uint32_t w = FindWidget(ctx, base, resName))
-            GWrite32(base, w + 368, uint32_t(display_settings::GetResolutionIndex()));
+        static const uint32_t delayName = GuestCString(base, "SelectValueMenuItemMode007-01-07");
+        if (display)
+        {
+            if (const uint32_t w = FindWidget(ctx, base, modeName)) GWrite32(base, w + 368, uint32_t(display_settings::GetMode()));
+            if (const uint32_t w = FindWidget(ctx, base, resName))
+                GWrite32(base, w + 368, uint32_t(display_settings::GetResolutionIndex()));
+        }
+        else if (const uint32_t w = FindWidget(ctx, base, delayName))
+            GWrite32(base, w + 368, display_settings::GetInputDelayOn() ? 1u : 0u);
     }
     ctx = saved;
+}
+
+// lib::GameOptionSetBattlePosition (impl sub_82374700): Game Options stores its rows as it closes,
+// BATTLE POSITION last - INPUT DELAY's cursor is stored with it.
+PPC_FUNC(sub_82374700)
+{
+    __imp__sub_82374700(ctx, base);
+    const PPCContext saved = ctx;
+    {
+        GuestFrame frame(ctx, base, 0x100);
+        static const uint32_t delayName = GuestCString(base, "SelectValueMenuItemMode007-01-07");
+        if (const uint32_t w = FindWidget(ctx, base, delayName))
+            display_settings::SetInputDelayOn(GRead32(base, w + 368) == 1);
+    }
+    ctx = saved;
+}
+
+// lib::GameOptionResetToDefaults (impl sub_823747C0): Game Options' DEFAULT resets INPUT DELAY too
+// (its cursor follows when the page re-initialises BATTLE POSITION's).
+PPC_FUNC(sub_823747C0)
+{
+    __imp__sub_823747C0(ctx, base);
+    display_settings::SetInputDelayOn(false);
 }
 
 // TitleMode::Impl::state_title_main: the logo waiting for START (sub_82622B70); impl+40 counts the

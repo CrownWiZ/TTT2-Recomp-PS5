@@ -23,4 +23,9 @@ void SetResolutionIndex(int index);     // clamps, persists, notifies the presen
 // Bumped on every change; the presenter compares it to apply new settings once.
 uint32_t Generation();
 
+// Options -> Game Options -> INPUT DELAY: the game's own 2-frame input delay in offline modes,
+// ON = the original, OFF = removed (input_delay.cpp). [Game] InputDelay=1|0, default 0 (OFF).
+bool GetInputDelayOn();
+void SetInputDelayOn(bool on);
+
 } // namespace display_settings

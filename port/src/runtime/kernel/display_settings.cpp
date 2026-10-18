@@ -2,6 +2,8 @@
 //   [Display]
 //   Mode=0|1|2            (windowed, borderless, fullscreen)
 //   Resolution=1920x1080
+//   [Game]
+//   InputDelay=0|1        (the game's 2-frame offline input delay: removed / original)
 // in %LOCALAPPDATA%\TTT2Recomp\settings.ini, read once at first use.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -20,6 +22,7 @@ std::mutex g_mutex;
 bool g_loaded = false;
 int g_mode = Windowed;
 int g_resolution = 0;
+bool g_inputDelay = false;
 std::atomic<uint32_t> g_generation{ 0 };
 
 std::string IniPath()
@@ -49,8 +52,9 @@ void LoadLocked()
         for (size_t i = 0; i < list.size(); ++i)
             if (list[i].width == w && list[i].height == h) g_resolution = int(i);
     }
-    std::fprintf(stderr, "[display] settings: mode=%d resolution=%ux%u (%s)\n", g_mode, Resolutions()[g_resolution].width,
-                 Resolutions()[g_resolution].height, ini.c_str());
+    g_inputDelay = GetPrivateProfileIntA("Game", "InputDelay", 0, ini.c_str()) != 0;
+    std::fprintf(stderr, "[display] settings: mode=%d resolution=%ux%u input delay %s (%s)\n", g_mode,
+                 Resolutions()[g_resolution].width, Resolutions()[g_resolution].height, g_inputDelay ? "on" : "off", ini.c_str());
 }
 
 void SaveLocked()
@@ -62,6 +66,7 @@ void SaveLocked()
     const Resolution r = Resolutions()[g_resolution];
     std::snprintf(value, sizeof(value), "%ux%u", r.width, r.height);
     WritePrivateProfileStringA("Display", "Resolution", value, ini.c_str());
+    WritePrivateProfileStringA("Game", "InputDelay", g_inputDelay ? "1" : "0", ini.c_str());
 }
 
 } // namespace
@@ -100,6 +105,18 @@ void SetResolutionIndex(int index)
     SaveLocked();
     g_generation.fetch_add(1);
     std::fprintf(stderr, "[display] resolution -> %ux%u\n", Resolutions()[index].width, Resolutions()[index].height);
+}
+
+bool GetInputDelayOn() { std::lock_guard<std::mutex> l(g_mutex); LoadLocked(); return g_inputDelay; }
+
+void SetInputDelayOn(bool on)
+{
+    std::lock_guard<std::mutex> l(g_mutex);
+    LoadLocked();
+    if (on == g_inputDelay) return;
+    g_inputDelay = on;
+    SaveLocked();
+    std::fprintf(stderr, "[display] input delay -> %s\n", on ? "on (the original 2 frames offline)" : "off");
 }
 
 } // namespace display_settings
