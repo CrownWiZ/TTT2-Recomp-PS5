@@ -5,7 +5,7 @@
 <h3 align="center">The Xbox 360 tag-team fighter, rebuilt to run natively on Windows.</h3>
 
 <p align="center">
-  59 fighters &nbsp;•&nbsp; Tag battles &nbsp;•&nbsp; Up to 4K at 60 fps &nbsp;•&nbsp; Online with your friends
+  59 fighters &nbsp;•&nbsp; Tag battles &nbsp;•&nbsp; Up to 4K at 60 fps &nbsp;•&nbsp; Rollback netcode &nbsp;•&nbsp; Ranked on community servers
 </p>
 
 <p align="center">
@@ -18,7 +18,7 @@
   <img src="https://img.shields.io/github/v/release/shihabal3amri/tekken-tag-tournament-2-pc?style=flat-square&label=latest&color=e85c1c" alt="Latest version">
   <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=flat-square&logo=windows&logoColor=white" alt="Windows 10 | 11">
   <img src="https://img.shields.io/badge/DirectX-11-2b2b2b?style=flat-square" alt="DirectX 11">
-  <img src="https://img.shields.io/badge/Online-Steam%20(beta)-1b2838?style=flat-square&logo=steam&logoColor=white" alt="Online over Steam (beta)">
+  <img src="https://img.shields.io/badge/Online-Steam%20%2B%20community%20servers-1b2838?style=flat-square&logo=steam&logoColor=white" alt="Online over Steam and community servers">
   <img src="https://img.shields.io/github/downloads/shihabal3amri/tekken-tag-tournament-2-pc/total?style=flat-square&label=downloads&color=555" alt="Downloads">
 </p>
 
@@ -35,12 +35,14 @@
     <td width="50%" valign="top">
       <h3>🎮 Native, not emulated</h3>
       The whole game was translated to run directly on your PC. No emulator to set up, no
-      settings to tweak: install it and play.
+      settings to tweak: install it and play. The installer prepares all the game's shaders up
+      front, so fights don't stutter the first time you see them.
     </td>
     <td width="50%" valign="top">
       <h3>🖥️ Sharp at any size</h3>
-      True HD rendering from 720p all the way up to 4K, at a smooth 60 fps. Play in a window,
-      borderless, or full screen.
+      From 360p for older PCs all the way up to 4K, at a smooth 60 fps. Optional sharpening,
+      anti-aliasing and texture filtering, VSYNC on or off, and shadows you can turn off. Play
+      in a window, borderless, or full screen.
     </td>
   </tr>
   <tr>
@@ -50,15 +52,28 @@
       servers, along with the game's final balance update.
     </td>
     <td valign="top">
-      <h3>🌐 Fight your friends online</h3>
-      Player Match over Steam. No port forwarding, no Xbox LIVE: host a session and your friend
-      finds it. <i>(Beta)</i>
+      <h3>🌐 Rollback netcode</h3>
+      Online fights use rollback, so they stay smooth when the connection wobbles. Play over
+      Steam with no port forwarding and no Xbox LIVE: host a room, invite a friend, fight.
+    </td>
+  </tr>
+  <tr>
+    <td valign="top">
+      <h3>🏆 Ranked is back</h3>
+      Join a <b>community server</b> run by players for Ranked Match, leaderboards, teams,
+      Tekken Channel replays and other players' ghosts. Anyone can host one.
+    </td>
+    <td valign="top">
+      <h3>⚡ Less input delay</h3>
+      The 2 frames of delay the original adds to offline modes are gone (switch them back on if
+      you like), and controllers are read every millisecond.
     </td>
   </tr>
   <tr>
     <td valign="top">
       <h3>🕹️ Grab a controller</h3>
-      Plug in an Xbox controller (or any Xbox-compatible pad) and go. The keyboard works too.
+      Plug in an Xbox controller (or any Xbox-compatible pad) and go. The keyboard works too,
+      with keys you can change, and two players can tag-team on one PC, online too.
     </td>
     <td valign="top">
       <h3>💾 Your progress, kept safe</h3>
@@ -106,8 +121,8 @@
 **1. Download** &nbsp; Get `ttt2_setup.exe` from the [latest release](https://github.com/shihabal3amri/tekken-tag-tournament-2-pc/releases/latest).
 
 **2. Point it at your game** &nbsp; Choose your disc image of *Tekken Tag Tournament 2 (USA, Europe)*
-and its *Title Update 3*. The installer checks them and builds the PC version for you, usually
-in a few minutes.
+and its *Title Update 3*. The installer checks them, builds the PC version and prepares the
+game's shaders for you, usually in a few minutes.
 
 **3. Play** &nbsp; Launch *Tekken Tag Tournament 2* from your Desktop or Start menu.
 
@@ -126,24 +141,68 @@ in a few minutes.
 
 <table>
   <tr><td><b>System</b></td><td>Windows 10 or 11, 64-bit</td></tr>
-  <tr><td><b>Graphics</b></td><td>Any DirectX 11 graphics card</td></tr>
+  <tr><td><b>Graphics</b></td><td>Any DirectX 11 graphics card (on laptops, the port picks the dedicated one)</td></tr>
   <tr><td><b>Storage</b></td><td>About 13 GB free</td></tr>
   <tr><td><b>Your game</b></td><td><i>Tekken Tag Tournament 2 (USA, Europe)</i> Xbox 360 disc image (<code>.iso</code>) + Title Update 3</td></tr>
-  <tr><td><b>For online</b></td><td>The free Steam app, running and signed in</td></tr>
+  <tr><td><b>For online</b></td><td>The free Steam app, running and signed in (community servers too)</td></tr>
 </table>
 
 ---
 
-## Play online with friends
+## Play online
 
-1. Both of you install the **same version** of the port and keep **Steam** running.
-2. **Host:** `ONLINE MODE` → `PLAYER MATCH` → `CREATE SESSION`
-3. **Your friend:** `ONLINE MODE` → `PLAYER MATCH` → `SEARCH SESSION`, then pick your session.
-4. Fight!
+Both of you install the **same version** of the port and keep **Steam** running. Online fights
+use rollback netcode, and every match runs directly between the two players' PCs over Steam.
+
+### With a friend, over Steam
+
+1. **Host:** `ONLINE MODE` → `PLAYER MATCH` → `CREATE SESSION`. In your room, press `Y`
+   (Friend Invite) to invite a Steam friend. Friends playing the game are listed first.
+2. **Your friend:** accept the invite in Steam, or go to `ONLINE MODE` → `PLAYER MATCH` →
+   `SEARCH SESSION` and pick your session.
+3. Fight!
 
 The first time you open Online Mode, the game shows Namco's online terms; accept them to
 continue. Steam will show you as playing **Spacewar**. That's normal: it's the free Steam test
 app the port uses to connect players.
+
+### On a community server: Ranked, leaderboards, replays
+
+Community servers are run by players. They're where players find each other, and they bring
+back what used to need Namco's servers: **Ranked Match, leaderboards, teams, Tekken Channel
+replay search and other players' ghosts**. Matches still run directly between the two
+players over Steam; the server never carries them.
+
+1. `ONLINE MODE` → `SERVER` → `ADD SERVER`, and type the server's address (a name or an IP;
+   add `:port` if it isn't 28200; `Ctrl` + `V` pastes).
+2. Pick it with `A`. The game remembers it and connects to it every time you open Online Mode.
+
+The list also shows each server's players and ping, and servers on your local network. On a
+server you meet only that server's players. Servers know you by your Steam account, so Steam
+still has to be running.
+
+**Host your own:** download `ttt2-server` for Windows or Linux from the
+[latest release](https://github.com/shihabal3amri/tekken-tag-tournament-2-pc/releases/latest)
+and follow the [server guide](server/README.md). It's one small program with no game data, and
+it comes with an admin panel in your browser (kicks, bans, match history, players online).
+
+### Netcode settings
+
+`OPTIONS` → `GAME OPTIONS` → `ONLINE NETCODE` balances input delay against rollback:
+
+| Setting | What it does |
+|---|---|
+| `STANDARD` (default) | The game's own input delay for your ping; rollback smooths out the bumps |
+| `PRIORITIZE RESPONSE` | One frame less input delay, more rollback corrections |
+| `PRIORITIZE GRAPHICS` | One frame more input delay, fewer corrections |
+| `CUSTOM` | Set the input delay and the rollback limit yourself |
+
+Both players always share one input delay, and the host's setting decides it.
+
+### Two players on one PC
+
+Pick `PAIR` at character select, then press `START` on the second controller when the game asks.
+It works offline and online; the second player plays as a guest of the first player's profile.
 
 ---
 
@@ -164,7 +223,13 @@ app the port uses to connect players.
 left/right to switch it to `KEYBOARD`, then `A` to edit. Pick a button, press `A`, then press the
 new key. `LB` / `RB` show the movement, START and BACK keys, plus `DEFAULTS` to undo everything.
 
-Display mode and resolution are in the game's own menu: `OPTIONS` → `DISPLAY SETTINGS`.
+**Display settings** are in the game's own menu, `OPTIONS` → `DISPLAY SETTINGS`: window mode,
+resolution (360p to 4K), `VSYNC`, `SHARPNESS`, `ANTI-ALIASING` (FXAA), `TEXTURE FILTERING` and
+`SHADOWS`. The picture options are off by default, so the game looks the way it did on the console.
+In borderless and full screen the mouse pointer is hidden.
+
+**Profiles:** `OPTIONS` → `SWITCH PROFILE` lists them; press `Y` to rename one (its saves stay
+with it).
 
 **Input delay:** the original game adds 2 frames of delay to every button press in offline modes.
 This port removes them by default; turn them back on in `OPTIONS` → `GAME OPTIONS` → `INPUT DELAY`.
@@ -206,10 +271,38 @@ image and tells you if it's a different version or damaged.
 </details>
 
 <details>
-<summary><b>The first fight stutters for a moment.</b></summary>
+<summary><b>Does it stutter the first time I see a stage or a move?</b></summary>
 <br>
-The game prepares its graphics the first time you see them. After that they're cached and it
-stays smooth.
+Not anymore. The installer prepares all the game's shaders before you play (the step
+"Preparing the game's shaders"), so nothing has to be compiled in the middle of a fight. If they
+are ever missing (another Windows account, a deleted cache), the game rebuilds them in the
+background by itself.
+</details>
+
+<details>
+<summary><b>My laptop runs the game on its integrated graphics.</b></summary>
+<br>
+The port asks Windows for the dedicated graphics card. If Windows still picks the integrated one,
+set <b>Tekken Tag Tournament 2</b> to <b>High performance</b> in <b>Settings → System → Display →
+Graphics</b>.
+</details>
+
+<details>
+<summary><b>Ranked Match can't find my friend.</b></summary>
+<br>
+Both of you need to be on the same community server. The game also only pairs players whose ranks
+are close: its default <code>RANK LIMITS</code> turns away a big rank gap. If you're far apart,
+both set <code>RANKED MATCH</code> → <code>RANK LIMITS</code> to <b>No Restrictions</b> before
+searching.
+</details>
+
+<details>
+<summary><b>Where are my replays?</b></summary>
+<br>
+<code>ONLINE MODE</code> → <code>TEKKEN CHANNEL</code> → <code>REPLAY THEATER</code>. It works on
+Steam too. Downloaded replays are in its <code>REPLAY DOWNLOAD LOG</code>, where the oldest are
+replaced when it's full, so save the ones you want to keep. Searching other players' replays needs
+a community server.
 </details>
 
 <details>
@@ -245,9 +338,10 @@ and attach <code>%LOCALAPPDATA%\TTT2Recomp\log.txt</code>. It tells us what happ
 
 ## Not available (yet)
 
-Online leaderboards, World Arena, replays and ghost downloads relied on Namco's servers, which
-are gone. Voice chat isn't supported. Ranked matches and Steam invites ("Invite to Game") haven't
-been tested yet.
+World Arena relied on Namco's servers, which are gone, and no community server has its lobbies
+yet. Voice chat isn't supported. Ranked Match, leaderboards, teams and replay search need a
+[community server](#on-a-community-server-ranked-leaderboards-replays); on plain Steam they're
+grayed out.
 
 ---
 
@@ -263,14 +357,16 @@ been tested yet.
 
 <p align="center">
   <b>For developers:</b> <a href="BUILDING.md">Building from source</a> &nbsp;•&nbsp;
-  <a href="port/INSTALLER.md">How the installer works</a>
+  <a href="port/INSTALLER.md">How the installer works</a> &nbsp;•&nbsp;
+  <a href="server/README.md">Hosting a community server</a>
 </p>
 
 <sub>
 Built with <a href="https://github.com/hedge-dev/XenonRecomp">XenonRecomp</a> (MIT), with
 <a href="https://github.com/hedge-dev/UnleashedRecomp">Unleashed Recompiled</a> and
 <a href="https://github.com/xenia-project/xenia">Xenia</a> as references. FFmpeg (LGPL) for
-XMA audio, libmspack (LGPL) for LZX, tiny-AES-c, and Steamworks for online play.
+XMA audio, libmspack (LGPL) for LZX, tiny-AES-c, and Steamworks for online play. The community
+server is written in Go; its licences are in <code>server/THIRD_PARTY_NOTICES.txt</code>.
 <br><br>
 Unofficial fan project, not affiliated with or endorsed by Bandai Namco or Microsoft. You must
 own the game. Tekken and all related characters and content are the property of their
