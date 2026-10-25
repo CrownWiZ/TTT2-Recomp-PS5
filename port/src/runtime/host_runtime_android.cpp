@@ -63,7 +63,7 @@ std::filesystem::path InstalledLayout(int argc)
     SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, "256");
     setenv("TTT2_AUDIO_PACE", "1", 0);
     setenv("DXVK_WSI_DRIVER", "SDL3", 0);
-    // DXVK reads this when creating the device, including direct SDL launches.
+    // Keep direct launches without app storage hidden as well.
     setenv("DXVK_HUD", "0", 1);
     setenv("TTT2_SHADER_WORKERS", "2", 0);
     setenv("TTT2_GPU_HW", "1", 0);
@@ -79,12 +79,10 @@ std::filesystem::path InstalledLayout(int argc)
     std::filesystem::create_directories(root / "config", error);
     std::filesystem::create_directories(root / "cache", error);
     std::filesystem::create_directories(root / "logs", error);
-    {
-        std::string enabled;
-        if (std::ifstream input(root / "config" / "debug_hud.txt");
-            input && std::getline(input, enabled) && enabled == "1")
-            setenv("DXVK_HUD", "fps,compiler,scale=1.3", 1);
-    }
+    // Create the HUD items once; the render thread polls this file for live
+    // visibility changes, including when resuming an existing game session.
+    setenv("DXVK_TTT2_HUD_FILE", (root / "config" / "debug_hud.txt").c_str(), 1);
+    setenv("DXVK_HUD", "fps,compiler,scale=1.3", 1);
     const int gameWorkers = ReadWorkerLimit(root / "config" / "game_shader_workers.txt", 2);
     const int dxvkWorkers = ReadWorkerLimit(root / "config" / "dxvk_shader_workers.txt", 2);
     setenv("TTT2_SHADER_WORKERS", std::to_string(gameWorkers).c_str(), 1);

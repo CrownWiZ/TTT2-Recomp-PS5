@@ -8,6 +8,7 @@
     "dxvk-1.9.2b-suboptimal-present.patch",
     "dxvk-1.9.2b-raw-cbuffer-words.patch",
     "dxvk-1.9.2b-ttt2-hud.patch",
+    "dxvk-1.9.2b-live-hud-toggle.patch",
     "dxvk-1.9.2b-persistent-pipeline-cache.patch",
     "dxvk-native-1.9.2b-shared-wsi.patch",
     "dxvk-1.9.2b-nonblocking-readback.patch",

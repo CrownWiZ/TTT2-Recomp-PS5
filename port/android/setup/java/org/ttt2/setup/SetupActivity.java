@@ -7,6 +7,7 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.os.ParcelFileDescriptor;
 import android.provider.OpenableColumns;
+import android.util.AtomicFile;
 import android.view.WindowManager;
 import android.widget.*;
 import java.io.*;
@@ -59,7 +60,7 @@ public final class SetupActivity extends Activity {
         shaderButton = button(layout, "Prepare shaders", this::prepare);
         cancelButton = button(layout, "Cancel", this::cancel);
         debugHudToggle = new CheckBox(this);
-        debugHudToggle.setText("Show debug HUD (next game start)");
+        debugHudToggle.setText("Show debug HUD");
         debugHudToggle.setChecked(readDebugHud(root));
         debugHudToggle.setOnClickListener(v -> {
             boolean enabled = debugHudToggle.isChecked();
@@ -172,7 +173,8 @@ public final class SetupActivity extends Activity {
     }
     private static boolean readDebugHud(File root) {
         if (root == null) return false;
-        try (BufferedReader reader = new BufferedReader(new FileReader(new File(root, "config/debug_hud.txt")))) {
+        AtomicFile setting = new AtomicFile(new File(root, "config/debug_hud.txt"));
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(setting.openRead(), StandardCharsets.UTF_8))) {
             return "1".equals(reader.readLine());
         } catch (IOException e) { return false; }
     }
@@ -180,8 +182,15 @@ public final class SetupActivity extends Activity {
         if (root == null) throw new IOException("App storage is unavailable");
         File config = new File(root, "config");
         if (!config.isDirectory() && !config.mkdirs()) throw new IOException("Cannot create settings");
-        try (FileOutputStream out = new FileOutputStream(new File(config, "debug_hud.txt"))) {
+        AtomicFile setting = new AtomicFile(new File(config, "debug_hud.txt"));
+        FileOutputStream out = null;
+        try {
+            out = setting.startWrite();
             out.write((enabled ? "1\n" : "0\n").getBytes(StandardCharsets.UTF_8));
+            setting.finishWrite(out);
+        } catch (IOException e) {
+            setting.failWrite(out);
+            throw e;
         }
     }
     private static void defaults(File root) throws IOException {
