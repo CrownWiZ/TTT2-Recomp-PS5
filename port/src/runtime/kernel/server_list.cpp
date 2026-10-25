@@ -7,13 +7,15 @@
 // Questions go out from one thread with two UDP sockets (IPv4 with broadcast, IPv6); every question has its own
 // random nonce, so an answer is matched to what was asked and nothing else. Names are resolved on short threads
 // of their own (a dead DNS name never holds the others up).
-#define WIN32_LEAN_AND_MEAN
-#include <winsock2.h>
-#include <ws2tcpip.h>
+#include "community_platform.h"
+#ifdef _WIN32
 #include <mstcpip.h>
-#include <windows.h>
 #include <wincrypt.h>
-#include <bcrypt.h>
+#else
+#include <openssl/evp.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#endif
 #include "server_list.h"
 #include <algorithm>
 #include <atomic>
@@ -28,7 +30,7 @@
 #include <sstream>
 #include <thread>
 
-#ifndef SIO_UDP_CONNRESET
+#if defined(_WIN32) && !defined(SIO_UDP_CONNRESET)
 #define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
 #endif
 
@@ -49,7 +51,7 @@ int64_t NowMs()
 uint64_t Random64()
 {
     uint64_t v = 0;
-    BCryptGenRandom(nullptr, reinterpret_cast<PUCHAR>(&v), sizeof(v), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    CommunityRandom(&v, sizeof(v));
     return v;
 }
 std::string Lower(std::string s)
@@ -63,12 +65,18 @@ std::string Lower(std::string s)
 std::string FilePath()
 {
     if (const char* e = std::getenv("TTT2_SERVERS_INI")) return e;
-    // Tests with their own save folder keep their own server list there (never the player's).
-    if (const char* saves = std::getenv("TTT2_SAVE_ROOT"); saves && *saves) return std::string(saves) + "\\servers.ini";
+    if (const char* saves = std::getenv("TTT2_SAVE_ROOT"); saves && *saves) return (std::filesystem::path(saves) / "servers.ini").string();
+#ifdef _WIN32
     const char* local = std::getenv("LOCALAPPDATA");
-    return std::string(local && *local ? local : ".") + "\\TTT2Recomp\\servers.ini";
+    return (std::filesystem::path(local && *local ? local : ".") / "TTT2Recomp" / "servers.ini").string();
+#else
+    if (const char* xdg = std::getenv("XDG_DATA_HOME"); xdg && *xdg) return (std::filesystem::path(xdg) / "TTT2Recomp" / "servers.ini").string();
+    const char* home = std::getenv("HOME");
+    return (std::filesystem::path(home && *home ? home : ".") / ".local/share/TTT2Recomp/servers.ini").string();
+#endif
 }
 
+#ifdef _WIN32
 std::string Protect(const std::string& plain)
 {
     if (plain.empty()) return {};
@@ -101,6 +109,10 @@ std::string Unprotect(const std::string& stored)
     LocalFree(out.pbData);
     return plain;
 }
+
+#else
+#include "community_password_posix.inc"
+#endif
 
 // One line of text in the file: no line breaks, printable.
 std::string OneLine(const std::string& s, size_t maxLen)
@@ -191,8 +203,13 @@ void Write()
         f << out.str();
         if (!f) { std::fprintf(stderr, "[servers] could not write %s\n", temp.c_str()); return; }
     }
+#ifdef _WIN32
     if (!MoveFileExA(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
         std::fprintf(stderr, "[servers] could not replace %s (%lu)\n", path.c_str(), GetLastError());
+#else
+    chmod(temp.c_str(), 0600);
+    if (std::rename(temp.c_str(), path.c_str())) std::fprintf(stderr, "[servers] could not replace %s\n", path.c_str());
+#endif
 }
 
 // ---- live answers
@@ -351,7 +368,11 @@ bool ReceiveOne(SOCKET s)
 {
     uint8_t buffer[2048];
     sockaddr_storage from{};
+    #ifdef _WIN32
     int fromLen = sizeof(from);
+#else
+    socklen_t fromLen = sizeof(from);
+#endif
     const int n = recvfrom(s, reinterpret_cast<char*>(buffer), sizeof(buffer), 0, reinterpret_cast<sockaddr*>(&from), &fromLen);
     if (n == SOCKET_ERROR) return WSAGetLastError() != WSAEWOULDBLOCK;   // other errors: try the next datagram
     const int64_t now = NowMs();
@@ -407,23 +428,27 @@ void Answer(const uint8_t* buffer, int n, const sockaddr_storage& from, int from
 
 void Loop()
 {
+#ifdef _WIN32
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);
+#endif
     // Non-blocking (every waiting answer is read at once), and an ICMP "port unreachable" from a server that is
     // down must not turn into an error on the socket (Windows' UDP connection reset: each one would hide an answer
     // behind it).
     auto prepare = [](SOCKET s) {
         u_long nonBlocking = 1;
         ioctlsocket(s, FIONBIO, &nonBlocking);
+#ifdef _WIN32
         BOOL off = FALSE;
         DWORD ignored = 0;
         WSAIoctl(s, SIO_UDP_CONNRESET, &off, sizeof(off), nullptr, 0, &ignored, nullptr, nullptr);
+#endif
     };
     g_s4 = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (g_s4 != INVALID_SOCKET)
     {
         prepare(g_s4);
-        BOOL on = TRUE;
+        int on = 1;
         setsockopt(g_s4, SOL_SOCKET, SO_BROADCAST, reinterpret_cast<const char*>(&on), sizeof(on));
         sockaddr_in any{};
         any.sin_family = AF_INET;
@@ -448,7 +473,7 @@ void Loop()
         if (g_s4 != INVALID_SOCKET) FD_SET(g_s4, &read);
         if (g_s6 != INVALID_SOCKET) FD_SET(g_s6, &read);
         timeval wait{ 0, 30000 };
-        if (select(0, &read, nullptr, nullptr, &wait) > 0)
+        if (select((std::max)(g_s4, g_s6) + 1, &read, nullptr, nullptr, &wait) > 0)
             for (const SOCKET s : { g_s4, g_s6 })
                 if (s != INVALID_SOCKET && FD_ISSET(s, &read))
                     for (int i = 0; i < 256 && ReceiveOne(s); ++i) {}

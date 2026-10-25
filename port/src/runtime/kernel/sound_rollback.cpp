@@ -9,7 +9,11 @@
 // returned. Calls the original did not make are new in the corrected timeline and run (a sound then
 // starts late by the rollback's depth instead of never). Main thread only.
 #include "kernel_shared.h"
+#include "host_thread.h"
+#include "host_vm.h"
+#if defined(_WIN32)
 #include <windows.h>
+#endif
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -46,7 +50,7 @@ struct FrameCalls { uint64_t frame = ~0ull; std::vector<Call> calls; size_t curs
 FrameCalls g_frames[kRing];
 FrameCalls* g_rec = nullptr;          // live frame being recorded
 FrameCalls* g_rep = nullptr;          // re-simulated frame being replayed
-DWORD g_main = 0;
+uint32_t g_main = 0;
 uint64_t g_replayed = 0, g_executed = 0;
 // Calls the API makes into itself (sub_82B1BAC0 releasing an object's old handle through B968, ...)
 // run as they are: only the game's own calls are recorded and answered (an outer call that runs for
@@ -174,7 +178,7 @@ bool CensusOn()
 template <class F>
 void Hook(int i, PPCContext& ctx, uint8_t* base, F original)
 {
-    if (GetCurrentThreadId() != g_main || !(g_rec || g_rep) || g_depth)
+    if (host_thread::CurrentId() != g_main || !(g_rec || g_rep) || g_depth)
     {
         SoundCall(original, ctx, base);
         return;
@@ -258,7 +262,7 @@ void Hook(int i, PPCContext& ctx, uint8_t* base, F original)
 extern "C" PPC_FUNC(__imp__sub_82B1C6B0);
 PPC_FUNC(sub_82B1C6B0)
 {
-    if (g_collect && GetCurrentThreadId() == g_main && Handle(ctx.r3.u32))
+    if (g_collect && host_thread::CurrentId() == g_main && Handle(ctx.r3.u32))
     {
         g_collected.push_back({ ctx.r3.u32, false });
         ++g_deferred;
@@ -268,7 +272,7 @@ PPC_FUNC(sub_82B1C6B0)
 }
 PPC_FUNC(sub_82B1D318)
 {
-    if (g_collect && GetCurrentThreadId() == g_main && ctx.r4.u32 == 0x72656C65 && Handle(ctx.r3.u32))
+    if (g_collect && host_thread::CurrentId() == g_main && ctx.r4.u32 == 0x72656C65 && Handle(ctx.r3.u32))
     {
         g_collected.push_back({ ctx.r3.u32, true });
         ++g_deferred;
@@ -347,7 +351,7 @@ void SoundRollbackFinal(PPCContext& ctx, uint8_t* base, uint64_t upTo)
 // live (record) or re-simulated (replay); frame = ~0 stops both.
 void SoundRollbackFrame(uint64_t frame, bool resim)
 {
-    g_main = GetCurrentThreadId();
+    g_main = host_thread::CurrentId();
     if (CensusOn())
     {
         static uint32_t frames = 0;

@@ -11,7 +11,7 @@
 // (the fingerprint as the server prints it: the game's SChannel re-encoding of the key must hash the same)
 #include "community_net.h"
 #include "server_list.h"
-#include <windows.h>
+#include "community_platform.h"
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -34,9 +34,7 @@ void Check(bool ok, const char* what)
 
 std::string TempFile(const char* name)
 {
-    char dir[MAX_PATH];
-    GetTempPathA(MAX_PATH, dir);
-    return std::string(dir) + name;
+    return (std::filesystem::temp_directory_path() / name).string();
 }
 
 // A session record as the port writes it (matchmaking.cpp Serialize): SES2 header, XSESSION_INFO naming the host.
@@ -71,7 +69,7 @@ int main(int argc, char** argv)
     base.gameProtocol = "ttt2-port-7-rollback";
     base.clientVersion = "community_net_test";
     base.knownServersFile = TempFile("ttt2_known_servers_test.txt");
-    DeleteFileA(base.knownServersFile.c_str());
+    std::remove(base.knownServersFile.c_str());
     base.timeoutMs = 5000;
 
     std::printf("address parsing\n");
@@ -113,7 +111,7 @@ int main(int argc, char** argv)
         Welcome wc;
         std::string e;
         Check(!c.Connect(oc, wc, e) && e.find("identity") != std::string::npos, "a changed server key is refused");
-        DeleteFileA(oc.knownServersFile.c_str());
+        std::remove(oc.knownServersFile.c_str());
     }
 
     std::printf("sessions\n");
@@ -188,9 +186,12 @@ int main(int argc, char** argv)
     std::printf("server list (servers.ini, INFO)\n");
     {
         const std::string ini = TempFile("ttt2_servers_test.ini");
-        DeleteFileA(ini.c_str());
+        std::remove(ini.c_str());
+#ifdef _WIN32
         SetEnvironmentVariableA("TTT2_SERVERS_INI", ini.c_str());
-        _putenv_s("TTT2_SERVERS_INI", ini.c_str());
+#else
+        setenv("TTT2_SERVERS_INI", ini.c_str(), 1);
+#endif
         Check(server_list::Save({ argv[1], "", "pass word;=x" }), "a server is saved");
         server_list::SetCurrent(argv[1]);
         std::string text;
@@ -200,7 +201,7 @@ int main(int argc, char** argv)
             for (size_t n; f && (n = std::fread(chunk, 1, sizeof(chunk), f)) > 0;) text.append(chunk, n);
             if (f) std::fclose(f);
         }
-        Check(text.find("dpapi:") != std::string::npos && text.find("pass word") == std::string::npos, "its password is stored encrypted");
+        Check((text.find("dpapi:") != std::string::npos || text.find("aesgcm:") != std::string::npos) && text.find("pass word") == std::string::npos, "its password is stored encrypted");
         const auto saved = server_list::List();
         Check(saved.size() == 1 && saved[0].password == "pass word;=x" && server_list::Current() == argv[1], "list, password and current read back");
         Check(server_list::SameAddress("LOCALHOST", "localhost:28200") && !server_list::SameAddress("a:1", "a:2"), "addresses compared");
@@ -248,7 +249,7 @@ int main(int argc, char** argv)
             if (f) std::fclose(f);
         }
         Check(pins.find(host + ":" + std::to_string(port)) == std::string::npos, "its pinned key is forgotten");
-        DeleteFileA(ini.c_str());
+        std::remove(ini.c_str());
     }
 
     std::printf("refusals\n");
@@ -269,7 +270,7 @@ int main(int argc, char** argv)
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     Check(b.ListSessions(20, 3000).empty(), "the session went with its host");
     b.Disconnect();
-    DeleteFileA(base.knownServersFile.c_str());
+    std::remove(base.knownServersFile.c_str());
     std::printf(g_failures ? "%d FAILED\n" : "ALL PASSED\n", g_failures);
     return g_failures ? 1 : 0;
 }
