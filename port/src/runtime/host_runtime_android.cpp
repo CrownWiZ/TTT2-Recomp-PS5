@@ -63,7 +63,8 @@ std::filesystem::path InstalledLayout(int argc)
     SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, "256");
     setenv("TTT2_AUDIO_PACE", "1", 0);
     setenv("DXVK_WSI_DRIVER", "SDL3", 0);
-    setenv("DXVK_HUD", "fps,compiler,scale=1.3", 0);
+    // DXVK reads this when creating the device, including direct SDL launches.
+    setenv("DXVK_HUD", "0", 1);
     setenv("TTT2_SHADER_WORKERS", "2", 0);
     setenv("TTT2_GPU_HW", "1", 0);
     setenv("TTT2_FBDUMP", "0", 0);
@@ -78,6 +79,12 @@ std::filesystem::path InstalledLayout(int argc)
     std::filesystem::create_directories(root / "config", error);
     std::filesystem::create_directories(root / "cache", error);
     std::filesystem::create_directories(root / "logs", error);
+    {
+        std::string enabled;
+        if (std::ifstream input(root / "config" / "debug_hud.txt");
+            input && std::getline(input, enabled) && enabled == "1")
+            setenv("DXVK_HUD", "fps,compiler,scale=1.3", 1);
+    }
     const int gameWorkers = ReadWorkerLimit(root / "config" / "game_shader_workers.txt", 2);
     const int dxvkWorkers = ReadWorkerLimit(root / "config" / "dxvk_shader_workers.txt", 2);
     setenv("TTT2_SHADER_WORKERS", std::to_string(gameWorkers).c_str(), 1);
@@ -126,7 +133,6 @@ std::filesystem::path InstalledLayout(int argc)
     }
     SetDefault("TTT2_GEOMETRY_MODE_FILE", root / "config" / "geometry_mode.txt");
     SetDefault("TTT2_AUDIO_PACE_FILE", root / "config" / "audio_pace.txt");
-    SetDefault("TTT2_RENDER_SCALE_FILE", root / "config" / "render_scale.txt");
     SetDefault("TTT2_SHADER_CACHE", root / "cache" / "shadercache");
     SetDefault("TTT2_VFS_ROOT", GameRoot() / "game_files_x");
     SetDefault("TTT2_SAVE_ROOT", root / "saves");
@@ -134,13 +140,10 @@ std::filesystem::path InstalledLayout(int argc)
     SetDefault("DXVK_STATE_CACHE_PATH", root / "cache");
     SetDefault("DXVK_PIPELINE_CACHE_FILE", root / "cache" / "dxvk-1.9.2b-ttt2-v1.vkcache");
     SetDefault("DXVK_LOG_PATH", root / "cache");
-    // A device-side diagnostic override lets the same APK compare GPU work at
-    // several internal resolutions without rebuilding or changing display mode.
-    if (std::ifstream scaleFile(root / "config" / "render_scale.txt"); scaleFile) {
-        float scale = 0.0f;
-        if (scaleFile >> scale && scale >= 0.5f && scale <= 4.0f)
-            setenv("TTT2_RENDER_SCALE", std::to_string(scale).c_str(), 1);
-    }
+    // RESOLUTION in Display Settings owns the render scale. Older setup versions
+    // created config/render_scale.txt with 0.75; leave it unused so upgrades also
+    // follow the saved in-game resolution. Explicit diagnostic environment
+    // overrides are handled by the renderer.
     if (argc > 1) return {};
     const auto image = GameRoot() / "tekken.img";
     return std::filesystem::is_regular_file(image, error) && !error ? image :

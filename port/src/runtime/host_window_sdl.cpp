@@ -86,7 +86,9 @@ Window* Open(uint32_t width, uint32_t height)
 #ifdef __ANDROID__
     // Android creates an EGL surface for the default OpenGL window. DXVK needs
     // the native window reserved for Vulkan when SDL_CreateWindow runs.
-    flags |= SDL_WINDOW_VULKAN;
+    // SDL fullscreen enables Android's immersive sticky mode, hiding both
+    // system bars and restoring them only temporarily for system gestures.
+    flags |= SDL_WINDOW_VULKAN | SDL_WINDOW_FULLSCREEN;
 #endif
     SDL_Window* handle = SDL_CreateWindow("Tekken Tag Tournament 2 (recomp)",
                                           int(width), int(height), flags);
@@ -175,6 +177,12 @@ void ApplyMode(Window* window, Mode mode, uint32_t width, uint32_t height)
 {
     if (!window) return;
     SDL_Window* handle = window->handle;
+#ifdef __ANDROID__
+    // Desktop display modes must not turn off SDL's Android immersive mode.
+    if (!SDL_SetWindowFullscreen(handle, true))
+        std::fprintf(stderr, "[window] Android fullscreen: %s\n", SDL_GetError());
+    return;
+#endif
     const SDL_DisplayID display = SDL_GetDisplayForWindow(handle);
     SDL_Rect bounds{0, 0, int(width), int(height)};
     if (display) {

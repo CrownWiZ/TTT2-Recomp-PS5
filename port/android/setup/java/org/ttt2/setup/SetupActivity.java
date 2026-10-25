@@ -22,6 +22,7 @@ public final class SetupActivity extends Activity {
     private Uri iso, tu;
     private TextView message;
     private Button isoButton, tuButton, installButton, playButton, cancelButton, shaderButton;
+    private CheckBox debugHudToggle;
     private ProgressBar bar;
     private File root;
 
@@ -57,6 +58,18 @@ public final class SetupActivity extends Activity {
         installButton = button(layout, "Extract game files", this::install);
         shaderButton = button(layout, "Prepare shaders", this::prepare);
         cancelButton = button(layout, "Cancel", this::cancel);
+        debugHudToggle = new CheckBox(this);
+        debugHudToggle.setText("Show debug HUD (next game start)");
+        debugHudToggle.setChecked(readDebugHud(root));
+        debugHudToggle.setOnClickListener(v -> {
+            boolean enabled = debugHudToggle.isChecked();
+            try { writeDebugHud(root, enabled); }
+            catch (IOException e) {
+                debugHudToggle.setChecked(!enabled);
+                Toast.makeText(this, "Cannot save debug HUD setting: " + e.getMessage(), Toast.LENGTH_LONG).show();
+            }
+        });
+        layout.addView(debugHudToggle);
         playButton = button(layout, "Start game", () -> {
             try {
                 if (!hasGameSession()) defaults(root);
@@ -152,14 +165,29 @@ public final class SetupActivity extends Activity {
         playButton.setText(resume ? "Resume game" : "Start game");
         playButton.setEnabled((resume || usable) && !job.running);
         shaderButton.setEnabled(usable && !job.running);
+        debugHudToggle.setEnabled(root != null && !job.running);
         bar.setProgress(job.percent);
         if (job.running) getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         else getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
     }
+    private static boolean readDebugHud(File root) {
+        if (root == null) return false;
+        try (BufferedReader reader = new BufferedReader(new FileReader(new File(root, "config/debug_hud.txt")))) {
+            return "1".equals(reader.readLine());
+        } catch (IOException e) { return false; }
+    }
+    private static void writeDebugHud(File root, boolean enabled) throws IOException {
+        if (root == null) throw new IOException("App storage is unavailable");
+        File config = new File(root, "config");
+        if (!config.isDirectory() && !config.mkdirs()) throw new IOException("Cannot create settings");
+        try (FileOutputStream out = new FileOutputStream(new File(config, "debug_hud.txt"))) {
+            out.write((enabled ? "1\n" : "0\n").getBytes(StandardCharsets.UTF_8));
+        }
+    }
     private static void defaults(File root) throws IOException {
         File config = new File(root, "config");
         if (!config.isDirectory() && !config.mkdirs()) throw new IOException("Cannot create settings");
-        String[][] defaults = {{"render_scale.txt", "0.75\n"}, {"geometry_mode.txt", "196608\n"}, {"video_hz.txt", "60\n"}};
+        String[][] defaults = {{"geometry_mode.txt", "196608\n"}, {"video_hz.txt", "60\n"}};
         for (String[] setting : defaults) {
             File file = new File(config, setting[0]);
             if (file.createNewFile()) try (FileOutputStream out = new FileOutputStream(file)) { out.write(setting[1].getBytes(StandardCharsets.UTF_8)); }
