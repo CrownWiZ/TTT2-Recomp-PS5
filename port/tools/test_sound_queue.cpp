@@ -10,6 +10,7 @@
 extern "C" PPC_FUNC(__imp__sub_82B1D970);
 namespace {
 constexpr uint32_t control = 0x830B8E70, pending = control + 88;
+constexpr uint32_t mutexHandle = 0x12340000;
 constexpr uint32_t queue = 0x100000, storage = queue + 32, capacity = 256;
 std::recursive_mutex queueMutex;
 thread_local int lockDepth = 0;
@@ -19,8 +20,12 @@ thread_local bool raceProducer = false;
 std::atomic<bool> consumerCountRead{false}, producerLockAttempted{false};
 }
 
-PPC_FUNC(sub_82CFEF90) {
-    assert(ctx.r3.u32 == control);
+// Run the generated mutex wrappers too, including their guest stack frames.
+// Only the OS boundary is mocked: wait indefinitely on a recursive mutant,
+// then release it. This catches wrapper calling-convention regressions that
+// mocking sub_82CFEF90/sub_82CFEFA8 directly would hide.
+PPC_FUNC(sub_82BEE890) {
+    assert(ctx.r3.u32 == mutexHandle && ctx.r4.s32 == -1);
     if (raceEnabled && raceProducer) {
         producerLockAttempted.store(true);
         producerLockAttempted.notify_one();
@@ -28,8 +33,8 @@ PPC_FUNC(sub_82CFEF90) {
     queueMutex.lock(); ++lockDepth;
     ctx.r3.u64 = 0;
 }
-PPC_FUNC(sub_82CFEFA8) {
-    assert(ctx.r3.u32 == control && lockDepth > 0);
+PPC_FUNC(sub_82BEEF30) {
+    assert(ctx.r3.u32 == mutexHandle && lockDepth > 0);
     --lockDepth; queueMutex.unlock();
     ctx.r3.u64 = 0;
 }
@@ -68,6 +73,7 @@ static void Reset(uint8_t* base) {
     GWrite32(base, queue, 0x626E7175);
     GWrite32(base, queue + 4, storage);
     GWrite32(base, queue + 8, capacity);
+    GWrite32(base, control, mutexHandle);
     GWrite32(base, control + 120, queue);
     GWrite32(base, pending, 0);
 }

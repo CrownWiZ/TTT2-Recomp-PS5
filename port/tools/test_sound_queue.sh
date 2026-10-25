@@ -15,7 +15,8 @@ root = Path(sys.argv[1])
 result = ['#include "ppc_recomp_shared.h"', 'void SoundQueueTestAfterCountRead();']
 for unit, functions in {
     240: ['82B1D970', '82B1D228', '82B1D298'],
-    290: ['82CFF140', '82CFF228', '82CFF2D8'],
+    290: ['82CFF140', '82CFF228', '82CFF2D8', '82CFEF90', '82CFEFA8'],
+    291: ['82D02310', '82D02340'],
 }.items():
     source = (root / f'ppc_recomp.{unit}.cpp').read_text()
     for address in functions:

@@ -31,6 +31,23 @@ const uint32_t kAddr[kCount] = { 0x82B1B0B0, 0x82B1B128, 0x82B1B140, 0x82B1B158,
 // take what their call sites set). Other registers hold the caller's leftovers and are not compared
 // (MEASURED: comparing them made re-simulated handle releases (B968, r3 only) look new - released twice).
 const uint8_t kArgs[kCount] = { 31, 3, 1, 1, 3, 0, 0, 1, 7, 7, 7, 7, 15, 15, 3, 3, 3, 1, 0, 0, 1, 1, 1, 1, 1, 3, 3, 1, 1, 1, 3, 3, 1, 7, 3, 7, 7, 3, 1, 15, 3, 3, 1, 1, 1, 1, 1, 3, 1, 15, 15, 3 };
+// Floating-point arguments are independent of r3-r7 in the guest ABI.
+// Compare only the live inputs: ignoring f1 can discard an unmute as a
+// duplicate mute, while comparing unused registers creates duplicate calls.
+uint8_t FloatArgs(int i)
+{
+    switch (kAddr[i])
+    {
+    case 0x82B1B8C0: case 0x82B1B8C8: // gain conversions
+    case 0x82B1BE70: case 0x82B1C498: // volume, pitch
+        return 1;
+    case 0x82B1BBF0: case 0x82B1BC78: case 0x82B1BD00: case 0x82B1CA40:
+        return 7;                   // three-component spatial parameters
+    default:
+        return 0;
+    }
+}
+bool FloatResult(int i) { return kAddr[i] == 0x82B1B8C0 || kAddr[i] == 0x82B1B8C8; }
 constexpr int kRing = 32;
 
 struct Call
@@ -39,6 +56,7 @@ struct Call
     bool used;
     bool out5, out6;
     uint32_t r3, r4, r5, r6, r7, lr, result, v5, v6;
+    uint64_t f1 = 0, f2 = 0, f3 = 0, floatResult = 0;
     std::vector<std::pair<uint32_t, uint8_t>> writes;     // the bytes it wrote into game objects
     uint32_t created = 0;                                  // the handle it stored in its out object
     uint32_t released = 0;                                 // B968: the handle whose reference it dropped
@@ -185,13 +203,16 @@ void Hook(int i, PPCContext& ctx, uint8_t* base, F original)
     }
     if (CensusOn()) { ++g_calls[i]; g_thisFrame[i] = true; }
     const uint32_t r3 = ctx.r3.u32, r4 = ctx.r4.u32, r5 = ctx.r5.u32, r6 = ctx.r6.u32, r7 = ctx.r7.u32;
+    const uint64_t f1 = ctx.f1.u64, f2 = ctx.f2.u64, f3 = ctx.f3.u64;
     if (g_rep)
     {
         const uint8_t m = kArgs[i];
+        const uint8_t fm = FloatArgs(i);
         const uint32_t lr = uint32_t(ctx.lr);
         auto same = [&](const Call& c) {
             return !c.used && c.fn == i && c.lr == lr && (!(m & 1) || c.r3 == r3) && (!(m & 2) || c.r4 == r4) &&
-                   (!(m & 4) || c.r5 == r5) && (!(m & 8) || c.r6 == r6) && (!(m & 16) || c.r7 == r7);
+                   (!(m & 4) || c.r5 == r5) && (!(m & 8) || c.r6 == r6) && (!(m & 16) || c.r7 == r7) &&
+                   (!(fm & 1) || c.f1 == f1) && (!(fm & 2) || c.f2 == f2) && (!(fm & 4) || c.f3 == f3);
         };
         std::vector<Call>& calls = g_rep->calls;
         Call* hit = nullptr;
@@ -206,6 +227,7 @@ void Hook(int i, PPCContext& ctx, uint8_t* base, F original)
             if (hit->out6) GWrite32(base, r6, hit->v6);
             for (const auto& [a, v] : hit->writes) base[a] = v;
             ctx.r3.u64 = hit->result;
+            if (FloatResult(i)) ctx.f1.u64 = hit->floatResult;
             ++g_replayed;
             return;
         }
@@ -229,6 +251,7 @@ void Hook(int i, PPCContext& ctx, uint8_t* base, F original)
         --g_depth;
         // It reached the engine: a later rollback into this frame must find it.
         Call c{ uint8_t(i), true, OnStack(r5), OnStack(r6), r3, r4, r5, r6, r7, lr, ctx.r3.u32, 0, 0 };
+        c.f1 = f1; c.f2 = f2; c.f3 = f3; c.floatResult = ctx.f1.u64;
         if (c.out5) c.v5 = GRead32(base, r5);
         if (c.out6) c.v6 = GRead32(base, r6);
         CaptureWrites(before, captured, c.writes);
@@ -249,6 +272,7 @@ void Hook(int i, PPCContext& ctx, uint8_t* base, F original)
     CollectCall(original, ctx, base);
     --g_depth;
     Call c{ uint8_t(i), false, OnStack(r5), OnStack(r6), r3, r4, r5, r6, r7, lr, ctx.r3.u32, 0, 0 };
+    c.f1 = f1; c.f2 = f2; c.f3 = f3; c.floatResult = ctx.f1.u64;
     if (c.out5) c.v5 = GRead32(base, r5);
     if (c.out6) c.v6 = GRead32(base, r6);
     CaptureWrites(before, captured, c.writes);
