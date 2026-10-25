@@ -145,10 +145,17 @@ void ApplyDeferred(PPCContext& ctx, uint8_t* base, Call& c)
 // Handles (an instance in the sound arena, its reference count at +28): sub_82B1BAC0 stores a new one in
 // a game object (+4) and takes a reference (sub_82B1C6A0); B968 drops it (sub_82B1C6B0) and clears +4;
 // BA68 posts the instance a 'rele' (sub_82B1D318). Creating calls and the object they fill: B830 r3,
-// C0C8 r5, CAC8 r6.
+// C0C8 r5, B570 / B5F8 / CAC8 r6. B570 and B5F8 create streamed music
+// instances too; discarding their timeline must release those instances.
 int IndexOf(uint32_t addr) { for (int i = 0; i < kCount; ++i) if (kAddr[i] == addr) return i; return -1; }
 const int kB830 = IndexOf(0x82B1B830), kC0C8 = IndexOf(0x82B1C0C8), kCAC8 = IndexOf(0x82B1CAC8), kB968 = IndexOf(0x82B1B968);
-uint32_t OutObject(int i, uint32_t r3, uint32_t r5, uint32_t r6) { return i == kB830 ? r3 : i == kC0C8 ? r5 : i == kCAC8 ? r6 : 0; }
+uint32_t OutObject(int i, uint32_t r3, uint32_t r5, uint32_t r6)
+{
+    if (i == kB830) return r3;
+    if (i == kC0C8) return r5;
+    if (i == kCAC8 || kAddr[i] == 0x82B1B570 || kAddr[i] == 0x82B1B5F8) return r6;
+    return 0;
+}
 bool Handle(uint32_t h) { return h >= 0x00100000u && h < 0x40000000u && (h & 3) == 0; }
 
 // The main thread's guest stack (thread block at 0x40000000): out-pointers into it are the call's
