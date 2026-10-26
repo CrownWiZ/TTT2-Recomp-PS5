@@ -3,11 +3,8 @@
 // not reorder; a large receive buffer keeps it lossless in practice, which is enough for the
 // two-instance test bed (Steam's reliable channel replaces it for real play). Tests can add delay,
 // jitter and loss (TTT2_NET_DELAY / _JITTER / _LOSS, below).
-#define WIN32_LEAN_AND_MEAN
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <mstcpip.h>
-#include <windows.h>
+#include "../host_udp.h"
+#include "../host_storage.h"
 #include "net_transport.h"
 #include "community_net.h"
 #include "profiles.h"
@@ -30,12 +27,6 @@
 
 bool SessionEnabled();   // rollback_session.cpp: rollback sessions (TTT2_ROLLBACK)
 
-#pragma comment(lib, "ws2_32.lib")
-
-#ifndef SIO_UDP_CONNRESET
-#define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
-#endif
-
 namespace net {
 namespace {
 
@@ -45,7 +36,7 @@ constexpr uint16_t kBasePort = 28100;
 std::mutex g_mutex;
 std::atomic<bool> g_started{ false };
 std::atomic<uint64_t> g_local{ 0 };
-SOCKET g_socket = INVALID_SOCKET;
+host_udp::Socket* g_socket = nullptr;
 Receiver g_receiver = nullptr;
 bool g_steam = false;
 // The community server players find each other on (sessions, invites, GIN); matches still run over this
@@ -214,7 +205,7 @@ struct Delayed
 {
     std::chrono::steady_clock::time_point due;
     uint64_t order;
-    sockaddr_in to;
+    uint16_t to;
     std::vector<uint8_t> bytes;
     bool operator>(const Delayed& o) const { return due != o.due ? due > o.due : order > o.order; }
 };
@@ -245,13 +236,12 @@ void SendLoop()
         Delayed d = g_delayed.top();
         g_delayed.pop();
         l.unlock();
-        sendto(g_socket, reinterpret_cast<const char*>(d.bytes.data()), int(d.bytes.size()), 0,
-               reinterpret_cast<const sockaddr*>(&d.to), sizeof(d.to));
+        host_udp::Send(g_socket, d.to, d.bytes.data(), d.bytes.size());
         l.lock();
     }
 }
 // False: dropped (TTT2_NET_LOSS). The packet leaves later from SendLoop.
-bool SendDelayed(const sockaddr_in& to, bool reliable, std::vector<uint8_t> bytes)
+bool SendDelayed(uint16_t to, bool reliable, std::vector<uint8_t> bytes)
 {
     const Conditions& c = Cond();
     std::lock_guard l(g_delayMutex);
@@ -274,12 +264,11 @@ void ReceiveLoop()
     std::vector<uint8_t> buffer(65536);
     for (;;)
     {
-        sockaddr_in from{};
-        int fromLen = sizeof(from);
-        const int n = recvfrom(g_socket, reinterpret_cast<char*>(buffer.data()), int(buffer.size()), 0,
-                               reinterpret_cast<sockaddr*>(&from), &fromLen);
-        if (n < 1) { if (n == SOCKET_ERROR && WSAGetLastError() == WSAENOTSOCK) return; continue; }
-        const uint64_t peer = kLoopTag | ntohs(from.sin_port);
+        uint16_t fromPort = 0;
+        const int n = host_udp::Receive(g_socket, buffer.data(), buffer.size(), fromPort);
+        if (n < 0) return;
+        if (n < 1) continue;
+        const uint64_t peer = kLoopTag | fromPort;
         // First byte: the channel; the rest is the packet.
         Deliver(peer, Channel(buffer[0] & 1), buffer.data() + 1, size_t(n - 1));
     }
@@ -290,8 +279,14 @@ void ReceiveLoop()
 std::string KnownServersFile()
 {
     if (const char* e = std::getenv("TTT2_KNOWN_SERVERS")) return e;
+#ifdef _WIN32
     const char* local = std::getenv("LOCALAPPDATA");
-    return std::string(local && *local ? local : ".") + "\\TTT2Recomp\\community\\known_servers.txt";
+    return (std::filesystem::path(local && *local ? local : ".") / "TTT2Recomp" / "community" / "known_servers.txt").string();
+#else
+    std::filesystem::path root;
+    if (host_storage::SaveBase(root)) root = ".";
+    return (root / "community" / "known_servers.txt").string();
+#endif
 }
 
 namespace {
@@ -323,7 +318,11 @@ bool LoginOptions(const std::string& address, const std::string& password, commu
     }
     else
     {
+#ifdef __ANDROID__
+        error = "Community servers require a Steam authentication ticket and Steam P2P. This Android build has no supported Steamworks client or authenticated Steam bridge.";
+#else
         error = "Steam is not running. Community servers know you by your Steam account: start Steam, then the game.";
+#endif
         return false;
     }
     const profiles::Profile me = profiles::Active();
@@ -436,29 +435,9 @@ bool Start(Receiver receiver)
         if (needSteam) return false;
         std::fprintf(stderr, "[net] Steam unavailable - loopback transport (this PC only)\n");
     }
-    WSADATA wsa;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa)) return false;
-    g_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (g_socket == INVALID_SOCKET) return false;
-    int big = 8 << 20;
-    setsockopt(g_socket, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&big), sizeof(big));
-    setsockopt(g_socket, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&big), sizeof(big));
-    BOOL exclusive = TRUE;
-    setsockopt(g_socket, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&exclusive), sizeof(exclusive));
-    // ICMP "port unreachable" must not turn into errors on the receive loop.
-    BOOL off = FALSE;
-    DWORD ignored = 0;
-    WSAIoctl(g_socket, SIO_UDP_CONNRESET, &off, sizeof(off), nullptr, 0, &ignored, nullptr, nullptr);
     uint16_t port = 0;
-    for (uint16_t n = 0; n < 64 && !port; ++n)
-    {
-        sockaddr_in a{};
-        a.sin_family = AF_INET;
-        a.sin_port = htons(uint16_t(kBasePort + n));
-        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        if (bind(g_socket, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0) port = uint16_t(kBasePort + n);
-    }
-    if (!port) { closesocket(g_socket); g_socket = INVALID_SOCKET; return false; }
+    g_socket = host_udp::BindLoopback(kBasePort, 64, port);
+    if (!g_socket) return false;
     g_receiver = receiver;
     g_local = kLoopTag | port;
     g_started = true;
@@ -475,18 +454,13 @@ bool Send(uint64_t peer, Channel channel, const void* data, size_t size)
 {
     if (g_steam) return steamnet::Send(peer, channel == Channel::Reliable, data, size);
     if (!g_started || (peer & 0xFFFFFFFF00000000ull) != kLoopTag || size + 1 > 65507) return false;
-    sockaddr_in to{};
-    to.sin_family = AF_INET;
-    to.sin_port = htons(uint16_t(peer & 0xFFFF));
-    to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     thread_local std::vector<uint8_t> packet;
     packet.resize(size + 1);
     packet[0] = uint8_t(channel);
     if (size) std::memcpy(packet.data() + 1, data, size);
     const Conditions& c = Cond();
-    if (c.delayMs || c.jitterMs || c.lossPct) return SendDelayed(to, channel == Channel::Reliable, packet);
-    return sendto(g_socket, reinterpret_cast<const char*>(packet.data()), int(packet.size()), 0,
-                  reinterpret_cast<sockaddr*>(&to), sizeof(to)) == int(packet.size());
+    if (c.delayMs || c.jitterMs || c.lossPct) return SendDelayed(uint16_t(peer & 0xFFFF), channel == Channel::Reliable, packet);
+    return host_udp::Send(g_socket, uint16_t(peer & 0xFFFF), packet.data(), packet.size());
 }
 
 } // namespace net

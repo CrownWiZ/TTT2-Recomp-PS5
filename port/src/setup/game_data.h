@@ -7,6 +7,7 @@
 #pragma once
 
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <map>
 #include <string>
@@ -45,6 +46,6 @@ using ByteProgress = std::function<bool(uint64_t done)>;
 // Expands an LZX container of `sourceSize` bytes into `outPath`, which must come out exactly
 // `expected` bytes long with an 'nrfi' archive header.
 bool ExpandContainer(const SourceReader& read, uint64_t sourceSize, uint64_t expected,
-                     const std::wstring& outPath, const ByteProgress& progress, std::string& err);
+                     const std::filesystem::path& outPath, const ByteProgress& progress, std::string& err);
 
 } // namespace ttt2::setup

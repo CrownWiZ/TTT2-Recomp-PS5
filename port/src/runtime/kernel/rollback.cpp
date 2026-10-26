@@ -30,8 +30,14 @@
 #include "kernel_shared.h"
 #include "guest_heap.h"
 #include "save_store.h"
+#include "host_thread.h"
+#include "host_vm.h"
+#if defined(_WIN32)
 #include <windows.h>
+#endif
+#if defined(_WIN32)
 #include <intrin.h>
+#endif
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -45,7 +51,11 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <thread>
+#include <ctime>
 #include <vector>
+
+
+static void RollbackSleep(uint32_t ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
 
 extern "C" PPC_FUNC(__imp__sub_825EF0B8);
 extern "C" PPC_FUNC(__imp__sub_822745B0);
@@ -72,7 +82,7 @@ bool SoundLibraryWriting(uint32_t page);               // sound_rollback.cpp: a 
 void XSessionReportMatch(bool started);                // xsession.cpp: a match starts / ends (the server's history)
 void SoundRollbackFinal(PPCContext& ctx, uint8_t* base, uint64_t upTo);   // sound_rollback.cpp: held drops / 'rele's
 bool RollbackNetWriting();                             // below: the online manager's per-frame update is running
-void NetNoteFaultLocked(uint32_t page);                 // below: its faults while calibrating
+void NetNoteFaultLocked(uint32_t page, uint32_t tid, bool net);                 // below: its faults while calibrating
 void ApplyNetWords();                                   // below: its words, masked at calibration's end
 void ClearNetWords();                                   // below: a new calibration
 void SoundRollbackSettle(PPCContext& ctx, uint8_t* base, uint64_t from, uint64_t to);   // sound_rollback.cpp
@@ -93,7 +103,7 @@ double GpuCpFrameMs();               // kernel_video.cpp: the command processor'
 
 void GuestThreadBlocks(std::vector<std::pair<uint32_t, uint32_t>>& out);   // kernel_thread.cpp
 void GameHeapOps(uint64_t& thread, uint64_t& all);                          // diag_hooks.cpp
-namespace hitch { uint32_t GuestEntryOfThread(DWORD tid); void DumpGuestThreads(); int GuestContexts(DWORD* tids, uint32_t* entries, PPCContext** ctxs, int max); }
+namespace hitch { uint32_t GuestEntryOfThread(uint32_t tid); void DumpGuestThreads(); int GuestContexts(uint32_t* tids, uint32_t* entries, PPCContext** ctxs, int max); }
 // rollback_session.cpp: online rollback sessions over NACE (TTT2_ROLLBACK=1).
 bool SessionEnabled();
 void SessionStateTrace(int32_t frame);   // rollback_session.cpp (TTT2_RB_NACETRACE): the state a snapshot holds
@@ -112,9 +122,9 @@ bool CheckLargeBlockHeaps(const char* where);   // below: Havok's large-block fr
 void PrintTaskCensus();   // below: the session's tasks (diagnostics)
 void PrintImportCensus();   // below: the online tasks' imports (diagnostics)
 uint32_t VdDeviceGuest();                                                   // kernel_video.cpp
-void WriteWatchPublish(int self, const PVOID* pages, size_t count);         // write_watch.cpp
+void WriteWatchPublish(int self, void* const* pages, size_t count);         // write_watch.cpp
 bool GpuRingDrained();                                                      // kernel_video.cpp
-bool WaitGpuProgress(uint32_t seen, DWORD ms);
+bool WaitGpuProgress(uint32_t seen, uint32_t ms);
 extern std::atomic<uint32_t> g_gpuProgress;
 void WriteWatchDrain(int self, uint32_t firstPage, uint32_t lastPage, std::vector<uint32_t>& out);
 bool CsThreadBlockedBy(unsigned long tid, unsigned long owner, uint32_t* section = nullptr, uint32_t* ownerLr = nullptr);   // kernel_misc.cpp
@@ -165,7 +175,7 @@ double Ms(std::chrono::steady_clock::time_point a, std::chrono::steady_clock::ti
 }
 
 // ---- pages ----------------------------------------------------------------------------------
-std::vector<PVOID> g_ww(1u << 18);
+std::vector<void*> g_ww(1u << 18);
 std::vector<uint8_t> g_isHot(1u << 20), g_excluded(1u << 20);   // per guest page
 std::vector<uint32_t> g_hot;                                    // append-only list of hot pages
 
@@ -174,11 +184,10 @@ void ReadWritten(std::vector<uint32_t>& out)
 {
     for (const Range& r : kRanges)
     {
-        ULONG_PTR count = g_ww.size();
-        DWORD granularity = 0;
-        if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, g_base + r.lo, r.hi - r.lo, g_ww.data(), &count, &granularity) != 0) continue;
+        size_t count = g_ww.size();
+        if (!host_vm::TakeWriteWatch(g_base + r.lo, r.hi - r.lo, g_ww.data(), g_ww.size(), count, true)) continue;
         WriteWatchPublish(1, g_ww.data(), count);   // consumer 1; the GPU backend's texture tracker still sees them
-        for (ULONG_PTR i = 0; i < count; ++i)
+        for (size_t i = 0; i < count; ++i)
             out.push_back(uint32_t(static_cast<uint8_t*>(g_ww[i]) - g_base));
         const size_t own = out.size();
         WriteWatchDrain(1, r.lo >> 12, r.hi >> 12, out);   // pages the texture tracker read first
@@ -213,7 +222,7 @@ std::vector<int32_t> g_hotIndex;                  // page -> index in g_hot, or 
 void NotePoolThread(uint32_t job)
 {
     std::lock_guard l(g_jobMutex);
-    g_poolJobThreads[job] = GetCurrentThreadId();
+    g_poolJobThreads[job] = host_thread::CurrentId();
 }
 void NotePoolThreadExit(uint32_t job)
 {
@@ -270,6 +279,13 @@ void MaskRange(uint32_t addr, uint32_t size)
 // The job system's static objects: the job group 0x82F4BF00 (queues out to +0x249C4), the singletons
 // at 0x82F72100 / 0x82F72C00. MEASURED: their lists half rewound hung list walks and waits.
 constexpr uint32_t kJobGroup = 0x82F4BF00, kJobSystemEnd = 0x82F73000;
+// sub_82259128's two-worker task queue. Its pending count (+128), queue
+// bookkeeping and completion latch (+68) accompany host-owned semaphores
+// (+24 work, +64 completion). Restoring a set latch after the completion
+// semaphore was consumed suppresses the next worker's signal, leaving the
+// owner in sub_82258AE8 while both workers wait in sub_82258BD8.
+// Keep only the scheduler header; worker scratch data starts at +144.
+constexpr uint32_t kTaskQueue = 0x82E6B0D0, kTaskQueueHeaderSize = 136;
 
 // The network's state is never rewound either: NACE (Namco's in-match netcode, code 0x82B344A0-
 // 0x82B5CA78) keeps sequence numbers, queues and connections; the online manager's static object
@@ -330,7 +346,13 @@ void NoteEvent(const char* what) { g_lastEvent = what; g_lastEventFrame = g_upda
 // Masks job objects seen since the last call, and all of them again for pages that just turned hot.
 void ApplyJobMasks(bool all)
 {
+    // NUSound's command ring belongs to the non-rewound sound arena. Its
+    // pending-frame count and adjacent audio-update count must stay on that
+    // timeline too, even if other writes make their static page rewound.
+    // Apply before every restore, including when the page was just discovered.
+    MaskRange(0x830B8EC8u, 8);
     if (all) MaskRange(kJobGroup, kJobSystemEnd - kJobGroup);
+    if (all) MaskRange(kTaskQueue, kTaskQueueHeaderSize);
     if (all) MaskRange(kOnlineManager, kOnlineManagerSize);
     {
         std::lock_guard b(g_blockMutex);
@@ -439,19 +461,19 @@ int FighterOf(uint32_t addr, uint32_t& offset);
 // library's threads (sub_82C3A4E0 / sub_82C3A540 - MEASURED: rewinding pages they share left the
 // sound thread spinning in sub_82D3E2D8), the file loaders (sub_823D94B8), and the runtime's own
 // host threads (DPC / vblank, command processor, audio output: no guest entry).
-DWORD g_mainTid = 0;
-std::atomic<DWORD> g_foreignThreads[64];
+uint32_t g_mainTid = 0;
+std::atomic<uint32_t> g_foreignThreads[64];
 std::atomic<int> g_foreignThreadCount{ 0 };
 void NoteForeignThread(const char* why = "its entry")
 {
-    const DWORD t = GetCurrentThreadId();
+    const uint32_t t = host_thread::CurrentId();
     const int n = (std::min)(g_foreignThreadCount.load(), 64);
     for (int i = 0; i < n; ++i) if (g_foreignThreads[i].load() == t) return;
     const int i = g_foreignThreadCount.fetch_add(1);
     if (i < 64) g_foreignThreads[i].store(t);
-    std::fprintf(stderr, "[rb] thread %lu (entry %08X) runs on its own timeline (%s)\n", t, hitch::GuestEntryOfThread(t), why);
+    std::fprintf(stderr, "[rb] thread %u (entry %08X) runs on its own timeline (%s)\n", t, hitch::GuestEntryOfThread(t), why);
 }
-bool IsFrameThread(DWORD t)
+bool IsFrameThread(uint32_t t)
 {
     if (t == g_mainTid) return true;
     const int n = (std::min)(g_foreignThreadCount.load(), 64);
@@ -466,7 +488,7 @@ bool IsFrameThread(DWORD t)
 // here, the page's content before it is kept, the page turns hot, and every older snapshot gets
 // that content. Host file reads into protected pages would fail instead of faulting: kernel_io.cpp
 // opens the range first (RollbackBeforeHostWrite).
-SRWLOCK g_cowLock = SRWLOCK_INIT;
+std::mutex g_cowLock;
 std::vector<uint8_t> g_protected(1u << 20);       // per page: write-protected by us
 struct LatePage { uint32_t page; std::unique_ptr<uint8_t[]> before; };
 std::vector<LatePage> g_pendingLate;               // under g_cowLock
@@ -475,7 +497,7 @@ std::atomic<bool> g_cowActive{ false };
 // write of a frame says who writes it.
 std::atomic<bool> g_attributing{ false };
 std::vector<uint8_t> g_frameWritten(1u << 20), g_foreignWritten(1u << 20);
-std::vector<DWORD> g_foreignTid(1u << 20);         // diagnostics: the first foreign writer
+std::vector<uint32_t> g_foreignTid(1u << 20);         // diagnostics: the first foreign writer
 // TTT2_RB_FOREIGN=keep: rewind other timelines' pages too (diagnostics).
 bool ExcludeForeign()
 {
@@ -493,34 +515,33 @@ std::vector<uint32_t> g_foreignOpened;             // under g_cowLock: opened by
 uint64_t g_foreignToHot = 0, g_foreignFaults = 0;
 // Diagnostics: the first pages foreign threads opened after calibration (page, thread, entry, guest
 // lr), noted under the lock in the fault handler and printed by the next update.
-struct ForeignOpen { uint32_t page; DWORD tid; uint32_t entry, lr; };
+struct ForeignOpen { uint32_t page; uint32_t tid; uint32_t entry, lr; };
 std::vector<ForeignOpen> g_foreignOpens;
 uint32_t g_foreignOpensTotal = 0;
 }   // namespace
-PPCContext* WatchGuestContextOf(DWORD tid);   // diag_hooks.cpp
+PPCContext* WatchGuestContextOf(uint32_t tid);   // diag_hooks.cpp
 namespace {
 
-void OpenPageLocked(uint32_t page)
+void OpenPageLocked(uint32_t page, uint64_t writer)
 {
     if (!g_protected[page >> 12]) return;
     // The sound library's writes are the sound engine's, whichever thread makes them; the online
     // manager's per-frame update (RollbackNetWriting) is the network's.
-    const bool frame = IsFrameThread(GetCurrentThreadId()) && !SoundLibraryWriting(page) && !RollbackNetWriting();
+    const uint32_t writerTid = uint32_t(writer);
+    const bool frame = (writer & (1ull << 32)) != 0;
     if (g_attributing.load(std::memory_order_relaxed))
     {
-        NetNoteFaultLocked(page);
+        NetNoteFaultLocked(page, writerTid, (writer & (1ull << 33)) != 0);
         (frame ? g_frameWritten : g_foreignWritten)[page >> 12] = 1;
-        if (!frame && !g_foreignTid[page >> 12]) g_foreignTid[page >> 12] = GetCurrentThreadId();
-        DWORD old = 0;
-        VirtualProtect(g_base + page, kPage, PAGE_READWRITE, &old);
+        if (!frame && !g_foreignTid[page >> 12]) g_foreignTid[page >> 12] = writerTid;
+        if (!host_vm::ProtectForRollback(g_base + page, kPage, false)) std::abort();
         g_protected[page >> 12] = 0;
         g_touched.push_back(page);
         return;
     }
     if (!frame && ExcludeForeign() && !g_isHot[page >> 12])   // another timeline's page: not rewound, watched
     {
-        DWORD old = 0;
-        VirtualProtect(g_base + page, kPage, PAGE_READWRITE, &old);
+        if (!host_vm::ProtectForRollback(g_base + page, kPage, false)) std::abort();
         g_protected[page >> 12] = 0;
         g_foreignOpened.push_back(page);
         ++g_foreignFaults;
@@ -528,7 +549,7 @@ void OpenPageLocked(uint32_t page)
         g_foreign[page >> 12] = 1;
         if (g_foreignOpensTotal++ < 200)
         {
-            const DWORD tid = GetCurrentThreadId();
+            const uint32_t tid = writerTid;
             const PPCContext* c = WatchGuestContextOf(tid);
             g_foreignOpens.push_back({ page, tid, hitch::GuestEntryOfThread(tid), c ? uint32_t(c->lr) : 0 });
         }
@@ -537,8 +558,7 @@ void OpenPageLocked(uint32_t page)
     if (g_foreign[page >> 12]) { g_foreign[page >> 12] = 0; ++g_foreignToHot; }   // the frame writes it too: rewound from now on
     auto before = std::make_unique<uint8_t[]>(kPage);
     std::memcpy(before.get(), g_base + page, kPage);
-    DWORD old = 0;
-    VirtualProtect(g_base + page, kPage, PAGE_READWRITE, &old);
+        if (!host_vm::ProtectForRollback(g_base + page, kPage, false)) std::abort();
     g_protected[page >> 12] = 0;
     g_pendingLate.push_back({ page, std::move(before) });
 }
@@ -550,46 +570,54 @@ bool InTracked(uint32_t guest)
     return false;
 }
 
-LONG CALLBACK CowVeh(EXCEPTION_POINTERS* ep)
+// Capture writer identity and TLS attribution before dispatching the fault to the
+// VM service thread. This callback performs no allocation or locking.
+uint64_t CaptureCowWriter(uintptr_t address)
 {
-    const EXCEPTION_RECORD* r = ep->ExceptionRecord;
-    if (r->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || r->NumberParameters < 2 || r->ExceptionInformation[0] != 1 || !g_base)
-        return EXCEPTION_CONTINUE_SEARCH;
-    const uint64_t a = r->ExceptionInformation[1];
-    if (a < uint64_t(g_base) || a >= uint64_t(g_base) + 0x100000000ull) return EXCEPTION_CONTINUE_SEARCH;
-    const uint32_t guest = uint32_t(a - uint64_t(g_base));
-    if (!InTracked(guest)) return EXCEPTION_CONTINUE_SEARCH;
-    // Ours if we protected it - whatever the mode flags say a moment later (a thread can fault
-    // between a mode ending and its pages opening) - or, while a mode runs, if another thread just
-    // opened it. Anything else is a real fault.
-    const bool active = g_cowActive.load(std::memory_order_acquire) || g_attributing.load(std::memory_order_acquire);
-    AcquireSRWLockExclusive(&g_cowLock);
+    const uint32_t page = uint32_t(address - uintptr_t(g_base)) & ~(kPage - 1);
+    const uint32_t tid = host_thread::CurrentId();
+    const bool net = RollbackNetWriting();
+    const bool frame = IsFrameThread(tid) && !SoundLibraryWriting(page) && !net;
+    return uint64_t(tid) | (uint64_t(frame) << 32) | (uint64_t(net) << 33);
+}
+
+bool CowWrite(uintptr_t address, uint64_t writer)
+{
+    if (!g_base || address < uintptr_t(g_base) || address - uintptr_t(g_base) >= 0x100000000ull) return false;
+    const uint32_t guest = uint32_t(address - uintptr_t(g_base));
+    if (!InTracked(guest)) return false;
+#if !defined(_WIN32)
+    // Native read-only COW pages remain logically writable; real guest
+    // protection faults must continue through the normal fault boundary.
+    if (!host_vm::CanWrite(g_base + guest, 1)) return false;
+#endif
+    std::lock_guard lock(g_cowLock);
     const uint32_t page = guest & ~(kPage - 1);
-    const bool ours = g_protected[page >> 12] != 0;
-    if (ours && active) OpenPageLocked(page);
-    else if (ours)
+    if (!g_protected[page >> 12]) return false;
+    const bool active = g_cowActive.load(std::memory_order_acquire) || g_attributing.load(std::memory_order_acquire);
+    if (active) OpenPageLocked(page, writer);
+    else
     {
-        DWORD old = 0;
-        VirtualProtect(g_base + page, kPage, PAGE_READWRITE, &old);
+        if (!host_vm::ProtectForRollback(g_base + page, kPage, false)) std::abort();
         g_protected[page >> 12] = 0;
     }
-    ReleaseSRWLockExclusive(&g_cowLock);
-    if (ours || active) return EXCEPTION_CONTINUE_EXECUTION;
-    // Opened while this thread waited for the lock (a mode ending opens every page under it): the
-    // write goes through now.
-    MEMORY_BASIC_INFORMATION mbi{};
-    if (VirtualQuery(g_base + page, &mbi, sizeof(mbi)) && (mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY)))
-        return EXCEPTION_CONTINUE_EXECUTION;
-    return EXCEPTION_CONTINUE_SEARCH;
+    return true;
+}
+
+void InstallCowObserver()
+{
+    static std::once_flag observer;
+    std::call_once(observer, [] {
+        if (!host_vm::RegisterRollbackWriteHandler(CaptureCowWriter, CowWrite)) std::abort();
+    });
 }
 
 // Calibration start: every tracked page but the excluded ones, write-protected.
 void StartAttribution()
 {
     ClearNetWords();
-    static std::once_flag veh;
-    std::call_once(veh, [] { AddVectoredExceptionHandler(1, CowVeh); });
-    AcquireSRWLockExclusive(&g_cowLock);
+    InstallCowObserver();
+    g_cowLock.lock();
     std::fill(g_frameWritten.begin(), g_frameWritten.end(), 0);
     std::fill(g_foreignWritten.begin(), g_foreignWritten.end(), 0);
     std::fill(g_foreign.begin(), g_foreign.end(), 0);
@@ -601,28 +629,26 @@ void StartAttribution()
             if (g_excluded[p >> 12]) { p += kPage; continue; }
             const uint32_t start = p;
             while (p < r.hi && !g_excluded[p >> 12]) { g_protected[p >> 12] = 1; p += kPage; }
-            DWORD old = 0;
-            VirtualProtect(g_base + start, p - start, PAGE_READONLY, &old);
+        if (!host_vm::ProtectForRollback(g_base + start, p - start, true)) std::abort();
         }
     g_attributing.store(true, std::memory_order_release);
-    ReleaseSRWLockExclusive(&g_cowLock);
+    g_cowLock.unlock();
 }
 // Each calibration frame start: the pages written last frame, protected again.
 void ReprotectTouched()
 {
-    AcquireSRWLockExclusive(&g_cowLock);
+    g_cowLock.lock();
     std::sort(g_touched.begin(), g_touched.end());
     for (size_t i = 0; i < g_touched.size();)
     {
         size_t j = i + 1;
         while (j < g_touched.size() && g_touched[j] == g_touched[j - 1] + kPage) ++j;
-        DWORD old = 0;
-        VirtualProtect(g_base + g_touched[i], uint32_t(j - i) * kPage, PAGE_READONLY, &old);
+        if (!host_vm::ProtectForRollback(g_base + g_touched[i], uint32_t(j - i) * kPage, true)) std::abort();
         for (size_t k = i; k < j; ++k) g_protected[g_touched[k] >> 12] = 1;
         i = j;
     }
     g_touched.clear();
-    ReleaseSRWLockExclusive(&g_cowLock);
+    g_cowLock.unlock();
 }
 void UnprotectAll();
 // Calibration end: the hot set = pages only frame threads wrote; pages a foreign thread wrote are
@@ -675,9 +701,8 @@ void FinishAttribution()
 
 void ProtectCold()
 {
-    static std::once_flag veh;
-    std::call_once(veh, [] { AddVectoredExceptionHandler(1, CowVeh); });
-    AcquireSRWLockExclusive(&g_cowLock);
+    InstallCowObserver();
+    g_cowLock.lock();
     uint32_t runs = 0, pages = 0;
     for (const Range& r : kRanges)
         for (uint32_t p = r.lo; p < r.hi;)
@@ -685,18 +710,17 @@ void ProtectCold()
             if (g_isHot[p >> 12] || g_excluded[p >> 12]) { p += kPage; continue; }
             const uint32_t start = p;
             while (p < r.hi && !g_isHot[p >> 12] && !g_excluded[p >> 12]) { g_protected[p >> 12] = 1; p += kPage; ++pages; }
-            DWORD old = 0;
-            VirtualProtect(g_base + start, p - start, PAGE_READONLY, &old);
+        if (!host_vm::ProtectForRollback(g_base + start, p - start, true)) std::abort();
             ++runs;
         }
     g_cowActive.store(true, std::memory_order_release);
-    ReleaseSRWLockExclusive(&g_cowLock);
+    g_cowLock.unlock();
     std::fprintf(stderr, "[rb] %u cold pages write-protected (%u runs)\n", pages, runs);
 }
 
 void UnprotectAll()
 {
-    AcquireSRWLockExclusive(&g_cowLock);
+    g_cowLock.lock();
     g_cowActive.store(false, std::memory_order_release);
     g_attributing.store(false, std::memory_order_release);
     g_touched.clear();
@@ -706,27 +730,25 @@ void UnprotectAll()
             if (!g_protected[p >> 12]) { p += kPage; continue; }
             const uint32_t start = p;
             while (p < r.hi && g_protected[p >> 12]) { g_protected[p >> 12] = 0; p += kPage; }
-            DWORD old = 0;
-            VirtualProtect(g_base + start, p - start, PAGE_READWRITE, &old);
+        if (!host_vm::ProtectForRollback(g_base + start, p - start, false)) std::abort();
         }
     g_pendingLate.clear();
     g_foreignOpened.clear();
-    ReleaseSRWLockExclusive(&g_cowLock);
+    g_cowLock.unlock();
 }
 
 // Every update start once calibrated: the foreign pages opened since, protected again (watched).
 void ReprotectForeign()
 {
-    AcquireSRWLockExclusive(&g_cowLock);
+    g_cowLock.lock();
     for (uint32_t page : g_foreignOpened)
     {
         if (!g_foreign[page >> 12] || g_protected[page >> 12] || g_isHot[page >> 12]) continue;
-        DWORD old = 0;
-        VirtualProtect(g_base + page, kPage, PAGE_READONLY, &old);
+        if (!host_vm::ProtectForRollback(g_base + page, kPage, true)) std::abort();
         g_protected[page >> 12] = 1;
     }
     g_foreignOpened.clear();
-    ReleaseSRWLockExclusive(&g_cowLock);
+    g_cowLock.unlock();
 }
 
 // The main thread's stack below the update's frame: what the update finds there (leftovers of the
@@ -781,9 +803,9 @@ void AddHotPage(uint32_t p);
 void IncorporateLate()
 {
     std::vector<LatePage> late;
-    AcquireSRWLockExclusive(&g_cowLock);
+    g_cowLock.lock();
     late.swap(g_pendingLate);
-    ReleaseSRWLockExclusive(&g_cowLock);
+    g_cowLock.unlock();
     bool added = false;
     for (LatePage& lp : late)
     {
@@ -946,14 +968,14 @@ uint32_t Compare(const Image& post, uint64_t frame, int& logged, bool detail, ui
             ++fighterWords;
             if (detail && fighterLogged++ < 40 && g_fighterBudget-- > 0)
                 std::fprintf(stderr, "[rb]   frame %llu fighter %d +%04X orig %08X resim %08X\n", (unsigned long long)frame, f, off,
-                             _byteswap_ulong(*reinterpret_cast<const uint32_t*>(was + k)), _byteswap_ulong(*reinterpret_cast<const uint32_t*>(now + k)));
+                             __builtin_bswap32(*reinterpret_cast<const uint32_t*>(was + k)), __builtin_bswap32(*reinterpret_cast<const uint32_t*>(now + k)));
         }
         if (!words) { --diffs; continue; }
         if (!detail || logged >= 10 || (g_st.tests >= 3 && (fighterWords == 0 || g_pageBudget-- <= 0))) continue;
         std::fprintf(stderr, "[rb]   frame %llu page %08X: %u words differ, first +%03X orig %08X resim %08X\n",
                      (unsigned long long)frame, g_hot[i], words, first,
-                     _byteswap_ulong(*reinterpret_cast<const uint32_t*>(was + first)),
-                     _byteswap_ulong(*reinterpret_cast<const uint32_t*>(now + first)));
+                     __builtin_bswap32(*reinterpret_cast<const uint32_t*>(was + first)),
+                     __builtin_bswap32(*reinterpret_cast<const uint32_t*>(now + first)));
         ++logged;
     }
     return diffs;
@@ -1009,6 +1031,9 @@ void DumpJobWords(const char* when)
         std::snprintf(line + n, sizeof(line) - n, " | 82F4BF00+212=%X 82F72100+4=%X 82F72C98+8=%X",
                       GRead32(g_base, 0x82F4BF00 + 212), GRead32(g_base, 0x82F72100 + 4), GRead32(g_base, 0x82F72C98 + 8));
     std::fprintf(stderr, "%s\n", line);
+    std::fprintf(stderr, "[rb] task queue %08X: queued=%u pending=%u completion-latch=%u work=%08X done=%08X\n",
+                 kTaskQueue, GRead32(g_base, kTaskQueue + 112), GRead32(g_base, kTaskQueue + 128),
+                 unsigned(g_base[kTaskQueue + 68]), GRead32(g_base, kTaskQueue + 24), GRead32(g_base, kTaskQueue + 64));
 }
 
 // The update starts pool jobs (animation and the like, state +144 = 2) that the draw finishes first
@@ -1075,7 +1100,7 @@ void LoaderNoteQueue(uint32_t q)
     if (std::find(g_loaderQueues.begin(), g_loaderQueues.end(), q) == g_loaderQueues.end())
     {
         g_loaderQueues.push_back(q);
-        std::fprintf(stderr, "[rb-ld] loader queue %08X (thread %lu)\n", q, GetCurrentThreadId());
+        std::fprintf(stderr, "[rb-ld] loader queue %08X (thread %u)\n", q, host_thread::CurrentId());
     }
 }
 void LoaderDone()
@@ -1149,7 +1174,7 @@ void QuiesceJobs(uint8_t*, const PPCContext&)
                              GRead32(g_base, kRenderMonitor + 16), GRead32(g_base, kRenderMonitor + 20));
             break;
         }
-        SwitchToThread();
+        std::this_thread::yield();
     }
     // The job group's workers (sub_82AD00E8; pending count +8): idle too.
     while (GRead32(g_base, kJobGroup + 8) != 0)
@@ -1160,12 +1185,12 @@ void QuiesceJobs(uint8_t*, const PPCContext&)
                 std::fprintf(stderr, "[rb] the job group still has %u pending after 100 ms\n", GRead32(g_base, kJobGroup + 8));
             break;
         }
-        SwitchToThread();
+        std::this_thread::yield();
     }
     g_renderWaitMs += Ms(r0, std::chrono::steady_clock::now());
     const auto t0 = std::chrono::steady_clock::now();
     bool waited = false;
-    const unsigned long self = GetCurrentThreadId();
+    const unsigned long self = host_thread::CurrentId();
     struct Lent { uint32_t section; int depth; uint32_t lr; };
     std::vector<Lent> lent;
     for (uint32_t job : jobs)
@@ -1241,7 +1266,7 @@ void QuiesceJobs(uint8_t*, const PPCContext&)
                     std::fprintf(stderr, "[rb] pool job %08X still busy (handshake %u) after 50 ms\n", job, s);
                 break;
             }
-            SwitchToThread();
+            std::this_thread::yield();
         }
     }
     // Havok's workers: the pool job that steps the physics waits for them (their finish semaphore), so
@@ -1257,7 +1282,7 @@ void QuiesceJobs(uint8_t*, const PPCContext&)
                     std::fprintf(stderr, "[rb-hk] %d Havok workers still run a job after 50 ms\n", g_hkBusy.load());
                 break;
             }
-            SwitchToThread();
+            std::this_thread::yield();
         }
     }
     // The file loaders: nothing queued, nothing running ("the file loaders' jobs" above). A loader thread
@@ -1271,7 +1296,7 @@ void QuiesceJobs(uint8_t*, const PPCContext&)
             bool lentOne = false;
             for (auto& slot : g_loaderBusyTid)
             {
-                const unsigned long tid = slot.load();
+                const uint32_t tid = slot.load();
                 uint32_t section = 0, ownerLr = 0;
                 if (!tid || !CsThreadBlockedBy(tid, self, &section, &ownerLr)) continue;
                 uint32_t lentLr = 0;
@@ -1280,7 +1305,7 @@ void QuiesceJobs(uint8_t*, const PPCContext&)
                 lent.push_back({ section, depth, lentLr });
                 lentOne = true;
                 if (g_loaderLent++ < 5)
-                    std::fprintf(stderr, "[rb-ld] loader thread %lu waits for section %08X, which this thread holds (taken at lr %08X): lent until its job is done (fight update %d)\n",
+                    std::fprintf(stderr, "[rb-ld] loader thread %u waits for section %08X, which this thread holds (taken at lr %08X): lent until its job is done (fight update %d)\n",
                                  tid, section, lentLr, g_fightRun);
             }
             if (Ms(l0, std::chrono::steady_clock::now()) > 100)
@@ -1298,7 +1323,7 @@ void QuiesceJobs(uint8_t*, const PPCContext&)
                 }
                 break;
             }
-            if (!lentOne) SwitchToThread();
+            if (!lentOne) std::this_thread::yield();
         }
         const double ms = Ms(l0, std::chrono::steady_clock::now());
         g_loaderWaitMs += ms;
@@ -1330,7 +1355,7 @@ void FinishPoolJobs(PPCContext& ctx, uint8_t* base, const PPCContext& entry)
     ctx.r3.u64 = kJobGroup;
     sub_82AD06F8(ctx, base);
     const auto t0 = std::chrono::steady_clock::now();
-    while (GRead32(g_base, kJobGroup + 8) != 0 && Ms(t0, std::chrono::steady_clock::now()) < 50) SwitchToThread();
+    while (GRead32(g_base, kJobGroup + 8) != 0 && Ms(t0, std::chrono::steady_clock::now()) < 50) std::this_thread::yield();
     if (GRead32(g_base, kJobGroup + 8) != 0 && g_st.groupStuck++ < 10)
         std::fprintf(stderr, "[rb]   job group still has %u pending after a re-simulated update\n", GRead32(g_base, kJobGroup + 8));
 }
@@ -1559,9 +1584,16 @@ void NoteMainFrameWork(bool rewound)
 {
     static uint64_t lastCycles = 0, lastTsc = 0;
     static double tscPerMs = 0;
+#if defined(_WIN32)
     ULONG64 c = 0;
     QueryThreadCycleTime(GetCurrentThread(), &c);
     const uint64_t tsc = __rdtsc();
+#else
+    timespec cpu{};
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu);
+    const uint64_t c = uint64_t(cpu.tv_sec) * 1000000000ull + cpu.tv_nsec;
+    const uint64_t tsc = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+#endif
     static const auto qpc0 = std::chrono::steady_clock::now();
     static const uint64_t tsc0 = tsc;
     const double since = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - qpc0).count();
@@ -1721,7 +1753,7 @@ void SessionSaveBeforeRestore(int32_t p, const char* what)
     if (SaveInProgress())
     {
         const auto w0 = std::chrono::steady_clock::now();
-        while (SaveInProgress() && std::chrono::steady_clock::now() - w0 < std::chrono::milliseconds(3000)) Sleep(1);
+        while (SaveInProgress() && std::chrono::steady_clock::now() - w0 < std::chrono::milliseconds(3000)) RollbackSleep(1);
         std::fprintf(stderr, "[rb-session] %s to frame %d waited %.1f ms for a save to finish%s\n", what, p,
                      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count(),
                      SaveInProgress() ? " - still open, going on anyway" : "");
@@ -1997,8 +2029,8 @@ void SessionSelfTest(PPCContext& ctx, uint8_t* base, const PPCContext& entry)
         for (uint32_t k = 0; k < kPage; k += 4)
         {
             if (std::memcmp(now + k, was + k, 4) == 0 || Outside(i, k / 8)) continue;
-            const Diff d{ g_hot[i] + k, _byteswap_ulong(*reinterpret_cast<const uint32_t*>(was + k)),
-                          _byteswap_ulong(*reinterpret_cast<const uint32_t*>(now + k)), -1, 0 };
+            const Diff d{ g_hot[i] + k, __builtin_bswap32(*reinterpret_cast<const uint32_t*>(was + k)),
+                          __builtin_bswap32(*reinterpret_cast<const uint32_t*>(now + k)), -1, 0 };
             uint32_t off = 0;
             const int f = FighterOf(d.addr, off);
             if (f >= 0) { ++fighterWords; if (fighterDiffs.size() < 64) fighterDiffs.push_back({ d.addr, d.live, d.resim, f, off }); }
@@ -2019,13 +2051,13 @@ void SessionSelfTest(PPCContext& ctx, uint8_t* base, const PPCContext& entry)
     // hot pages, then NACE's record.
     {
         std::vector<LatePage> opened;
-        AcquireSRWLockExclusive(&g_cowLock);
+        g_cowLock.lock();
         opened.swap(g_pendingLate);
-        ReleaseSRWLockExclusive(&g_cowLock);
+        g_cowLock.unlock();
         for (LatePage& lp : opened) std::memcpy(g_base + lp.page, lp.before.get(), kPage);
-        AcquireSRWLockExclusive(&g_cowLock);
+        g_cowLock.lock();
         for (LatePage& lp : opened) g_pendingLate.push_back(std::move(lp));
-        ReleaseSRWLockExclusive(&g_cowLock);
+        g_cowLock.unlock();
         IncorporateLate();
     }
     Restore(g_testNow);
@@ -2123,7 +2155,7 @@ bool SessionStep(PPCContext& ctx, uint8_t* base, const PPCContext& entry)
     // at 917 rewound only from 919); a side that is merely slow (TTT2_RB_SLOW) stays in sync.
     if (SessionYield())
     {
-        Sleep(16);
+        RollbackSleep(16);
         ++g_sess.yields;
         g_stepFlags |= 1;
     }
@@ -2173,10 +2205,10 @@ bool SessionStep(PPCContext& ctx, uint8_t* base, const PPCContext& entry)
     // words the pump changed there are masked (their earlier content goes into the older snapshots).
     {
         std::vector<std::pair<uint32_t, std::vector<uint8_t>>> opened;
-        AcquireSRWLockExclusive(&g_cowLock);
+        g_cowLock.lock();
         for (const LatePage& lp : g_pendingLate)
             if (!g_isHot[lp.page >> 12]) opened.push_back({ lp.page, std::vector<uint8_t>(lp.before.get(), lp.before.get() + kPage) });
-        ReleaseSRWLockExclusive(&g_cowLock);
+        g_cowLock.unlock();
         IncorporateLate();
         for (auto& [p, before] : opened)
         {
@@ -2258,14 +2290,14 @@ bool SessionStep(PPCContext& ctx, uint8_t* base, const PPCContext& entry)
 void RollbackBeforeHostWrite(uint32_t addr, uint32_t size)
 {
     if (!(g_cowActive.load(std::memory_order_acquire) || g_attributing.load(std::memory_order_acquire)) || !size) return;
-    AcquireSRWLockExclusive(&g_cowLock);
+    g_cowLock.lock();
     for (uint64_t p = addr & ~(kPage - 1); p < uint64_t(addr) + size; p += kPage)
-        if (p < 0x100000000ull && InTracked(uint32_t(p))) OpenPageLocked(uint32_t(p));
-    ReleaseSRWLockExclusive(&g_cowLock);
+        if (p < 0x100000000ull && InTracked(uint32_t(p))) OpenPageLocked(uint32_t(p), CaptureCowWriter(uintptr_t(g_base) + p));
+    g_cowLock.unlock();
 }
 
 // Diagnostics hooks (diag_hooks.cpp, kernel_video.cpp): time spent in a call during a re-simulated draw.
-bool RollbackInResimDraw() { return g_resimDraw && GetCurrentThreadId() == g_mainTid; }
+bool RollbackInResimDraw() { return g_resimDraw && host_thread::CurrentId() == g_mainTid; }
 void RollbackResimSkip() { ++g_throttleSkips; }
 void RollbackResimTime(int id, double ms)
 {
@@ -2465,7 +2497,7 @@ bool RollbackIsRewound(uint32_t addr)
 std::map<std::pair<uint32_t, uint32_t>, uint64_t> g_taskCensus;
 void RollbackTaskStep(uint32_t, uint32_t vtable, uint32_t step)
 {
-    if (!g_sess.on || GetCurrentThreadId() != g_mainTid || g_resimDraw || g_sessFrame < 0) return;
+    if (!g_sess.on || host_thread::CurrentId() != g_mainTid || g_resimDraw || g_sessFrame < 0) return;
     ++g_taskCensus[{ step, vtable }];
 }
 // TTT2_RB_SKIPONLINE=1 (experiment): re-simulated updates leave out the online system's tasks (step
@@ -2488,7 +2520,7 @@ void RollbackOnlineTaskScope(bool in) { t_onlineTaskDepth += in ? 1 : -1; }
 bool RollbackSkipTask(uint32_t step)
 {
     static const bool on = [] { const char* e = std::getenv("TTT2_RB_SKIPONLINE"); return e && *e == '1'; }();
-    return on && g_resimulating && GetCurrentThreadId() == g_mainTid && step >= 0x82690000u && step < 0x826D0000u;
+    return on && g_resimulating && host_thread::CurrentId() == g_mainTid && step >= 0x82690000u && step < 0x826D0000u;
 }
 
 // The online system's tasks keep the network's state (acknowledgements, timeouts, messages received)
@@ -2521,7 +2553,7 @@ void RollbackImportNote(const char* name)
 uint64_t g_sendsSuppressed = 0;
 bool RollbackSuppressSend()
 {
-    if (!t_inOnlineStep || !g_resimulating || GetCurrentThreadId() != g_mainTid) return false;
+    if (!t_inOnlineStep || !g_resimulating || host_thread::CurrentId() != g_mainTid) return false;
     if (g_sendsSuppressed++ < 10) std::fprintf(stderr, "[rb-session] an online task's send in a re-simulated frame: not sent again\n");
     return true;
 }
@@ -2533,8 +2565,8 @@ void PrintImportCensus()
 }
 void RollbackOnlineStep(bool begin, uint32_t step)
 {
-    if (GetCurrentThreadId() == g_mainTid) t_inOnlineStep += begin ? 1 : -1;
-    if (!g_sess.on || g_resimulating || g_resimDraw || GetCurrentThreadId() != g_mainTid || g_sessFrame < 0) return;
+    if (host_thread::CurrentId() == g_mainTid) t_inOnlineStep += begin ? 1 : -1;
+    if (!g_sess.on || g_resimulating || g_resimDraw || host_thread::CurrentId() != g_mainTid || g_sessFrame < 0) return;
     if (step < 0x82690000u || step >= 0x826D0000u || g_sess.consumed >= uint64_t(OnlineLearnFrames())) return;
     if (begin)
     {
@@ -2565,8 +2597,8 @@ void RollbackOnlineStep(bool begin, uint32_t step)
             MaskRange(p + w, 8);
             if (g_onlineMasked++ < 40)
                 std::fprintf(stderr, "[rb-session] online word %08X (task %08X): %08X %08X -> %08X %08X\n", p + w, step,
-                             _byteswap_ulong(*reinterpret_cast<const uint32_t*>(known->before.data() + w)),
-                             _byteswap_ulong(*reinterpret_cast<const uint32_t*>(known->before.data() + w + 4)),
+                             __builtin_bswap32(*reinterpret_cast<const uint32_t*>(known->before.data() + w)),
+                             __builtin_bswap32(*reinterpret_cast<const uint32_t*>(known->before.data() + w + 4)),
                              GRead32(g_base, p + w), GRead32(g_base, p + w + 4));
         }
     }
@@ -2740,7 +2772,7 @@ int32_t RollbackSaveJournalFrame()
 void RollbackNoteIo(bool frameOnly, const char* op, const PPCContext* ctx)
 {
     if (!MachineryOn() || !g_base || g_fightRun == 0) return;
-    if (frameOnly && !IsFrameThread(GetCurrentThreadId())) return;
+    if (frameOnly && !IsFrameThread(host_thread::CurrentId())) return;
     // A save in progress (a save container opened, kernel_content.cpp): its I/O is the save's, which is
     // a whole: a rewind waits until the container is closed (SessionRewind) and the timeline that stays
     // saves again if it gets there too - a complete save done twice is an overwrite. What broke a save
@@ -2752,8 +2784,8 @@ void RollbackNoteIo(bool frameOnly, const char* op, const PPCContext* ctx)
     {
         static int logged = 0;
         if (logged++ < 20)
-            std::fprintf(stderr, "[rb-session] save I/O at frame %d (%s, thread %lu): part of the save, no barrier\n", g_sess.last, op,
-                         GetCurrentThreadId());
+            std::fprintf(stderr, "[rb-session] save I/O at frame %d (%s, thread %u): part of the save, no barrier\n", g_sess.last, op,
+                         host_thread::CurrentId());
         return;
     }
     // A thread outside the frame (the game's save thread) reaching the outside world while a session's
@@ -2762,20 +2794,20 @@ void RollbackNoteIo(bool frameOnly, const char* op, const PPCContext* ctx)
     // final KO in a predicted frame started the profile save (XamContentCreateEx + Tag25SaveData files
     // on worker 16584); the barrier then refused the rewind a misprediction needed and the instances
     // ended 5 frames apart. The main thread never waits here (it confirms frames).
-    if (g_sess.on && !IsFrameThread(GetCurrentThreadId()))
+    if (g_sess.on && !IsFrameThread(host_thread::CurrentId()))
     {
         const int32_t upTo = g_sess.last;
         const auto start = std::chrono::steady_clock::now();
         int32_t confirmed = SessionConfirmedFrame();
         while (g_sess.on && confirmed < upTo && std::chrono::steady_clock::now() - start < std::chrono::seconds(3))
         {
-            Sleep(1);
+            RollbackSleep(1);
             confirmed = SessionConfirmedFrame();
         }
         static int logged = 0;
         if (logged++ < 40)
-            std::fprintf(stderr, "[rb-session] I/O by thread %lu outside the frame (%s) at frame %d: waited %.1f ms for confirmation (confirmed %d)\n",
-                         GetCurrentThreadId(), op, upTo, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(),
+            std::fprintf(stderr, "[rb-session] I/O by thread %u outside the frame (%s) at frame %d: waited %.1f ms for confirmation (confirmed %d)\n",
+                         host_thread::CurrentId(), op, upTo, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(),
                          confirmed);
         return;
     }
@@ -2796,16 +2828,16 @@ void RollbackNoteIo(bool frameOnly, const char* op, const PPCContext* ctx)
                 sp = prev;
             }
         }
-        std::fprintf(stderr, "[rb-session] I/O at frame %d (%s, %s thread %lu, %s update): no rewind before frame %d; callers %08X %08X %08X %08X %08X %08X\n",
-                     g_sess.last, op, GetCurrentThreadId() == g_mainTid ? "main" : "worker", GetCurrentThreadId(), g_inUpdate ? "in the" : "outside the",
+        std::fprintf(stderr, "[rb-session] I/O at frame %d (%s, %s thread %u, %s update): no rewind before frame %d; callers %08X %08X %08X %08X %08X %08X\n",
+                     g_sess.last, op, host_thread::CurrentId() == g_mainTid ? "main" : "worker", host_thread::CurrentId(), g_inUpdate ? "in the" : "outside the",
                      g_sessBarrier, chain[0], chain[1], chain[2], chain[3], chain[4], chain[5]);
     }
     if (g_barrier < g_frame + 1)
     {
         g_barrier = g_frame + 1;
         static int logged = 0;
-        if (logged++ < 20) std::fprintf(stderr, "[rb] I/O at frame %llu (thread %lu): no rewind before frame %llu\n",
-                                        (unsigned long long)g_frame, GetCurrentThreadId(), (unsigned long long)g_barrier);
+        if (logged++ < 20) std::fprintf(stderr, "[rb] I/O at frame %llu (thread %u): no rewind before frame %llu\n",
+                                        (unsigned long long)g_frame, host_thread::CurrentId(), (unsigned long long)g_barrier);
     }
 }
 
@@ -2824,7 +2856,7 @@ static void FrameWatchdog()
     int64_t reported = 0;
     for (;;)
     {
-        Sleep(500);
+        RollbackSleep(500);
         const int64_t since = g_frameSince.load();
         const PPCContext* c = g_frameCtx.load();
         if (!since || !c || since == reported || WatchdogMs() - since < 3000) continue;
@@ -2903,7 +2935,7 @@ static void FrameWatchdog()
         // for (sub_82BB2940: node +4 = next): their registers and the +4 chain from r31 (a node seen
         // twice = a cycle).
         {
-            DWORD tids[64]; uint32_t entries[64]; PPCContext* ctxs[64];
+            uint32_t tids[64]; uint32_t entries[64]; PPCContext* ctxs[64];
             const int count = hitch::GuestContexts(tids, entries, ctxs, 64);
             for (int t = 0; t < count; ++t)
             {
@@ -2911,7 +2943,7 @@ static void FrameWatchdog()
                 const uint32_t lr = uint32_t(o->lr);
                 if (o == c || (lr >= 0x82BE0000u && lr < 0x82C10000u) || lr == 0x824F54F0u) continue;
                 char regs[1400];
-                int q = std::snprintf(regs, sizeof(regs), "[rb-watchdog]   thread %lu (entry %08X) lr %08X registers:", tids[t], entries[t], lr);
+                int q = std::snprintf(regs, sizeof(regs), "[rb-watchdog]   thread %u (entry %08X) lr %08X registers:", tids[t], entries[t], lr);
                 const PPCRegister* gpr[] = { &o->r3, &o->r4, &o->r5, &o->r6, &o->r7, &o->r8, &o->r9, &o->r10, &o->r11,
                     &o->r14, &o->r15, &o->r16, &o->r17, &o->r18, &o->r19, &o->r20, &o->r21, &o->r22, &o->r23, &o->r24,
                     &o->r25, &o->r26, &o->r27, &o->r28, &o->r29, &o->r30, &o->r31 };
@@ -2924,7 +2956,7 @@ static void FrameWatchdog()
                 }
                 std::fprintf(stderr, "%s\n", regs);
                 char links[1400];
-                int z = std::snprintf(links, sizeof(links), "[rb-watchdog]   thread %lu chain +4 from r31:", tids[t]);
+                int z = std::snprintf(links, sizeof(links), "[rb-watchdog]   thread %u chain +4 from r31:", tids[t]);
                 uint32_t seen[24]; int seenCount = 0;
                 uint32_t at = o->r31.u32;
                 for (int i = 0; i < 24 && at >= 0x00100000u && at < kImageEnd && !(at >= VHEAP_END && at < 0x82000000u) && z < int(sizeof(links)) - 48; ++i)
@@ -2950,7 +2982,7 @@ static void FrameWatchdog()
                         const uint32_t obj = GRead32(g_base, prev - 12);
                         if (obj < 0x00100000u || obj >= kImageEnd) break;
                         char list[2400];
-                        int y = std::snprintf(list, sizeof(list), "[rb-watchdog]   thread %lu effect object %08X(%s): head %08X tail %08X count %u; nodes:",
+                        int y = std::snprintf(list, sizeof(list), "[rb-watchdog]   thread %u effect object %08X(%s): head %08X tail %08X count %u; nodes:",
                                               tids[t], obj, kind(obj), GRead32(g_base, obj + 1128), GRead32(g_base, obj + 1132), GRead32(g_base, obj + 1136));
                         uint32_t nodes[64]; int nodeCount = 0;
                         uint32_t at2 = GRead32(g_base, obj + 1128), back = 0;
@@ -3023,7 +3055,7 @@ void RollbackHeapOp(bool alloc, uint32_t ptr, uint32_t size, const PPCContext& c
 {
     static const bool on = [] { const char* e = std::getenv("TTT2_RB_HEAPLOG"); return e && *e == '1'; }();
     RollbackFindBlock(alloc, ptr, size, ctx);
-    const DWORD t = GetCurrentThreadId();
+    const uint32_t t = host_thread::CurrentId();
     // A session's NACE pump allocating from the game heap: counted (the heap's free lists are
     // rewound, NACE's blocks are not).
     if (g_inPump && t == g_mainTid && g_base)
@@ -3086,7 +3118,7 @@ void RollbackHeapOp(bool alloc, uint32_t ptr, uint32_t size, const PPCContext& c
         chain[i] = GRead32(g_base, prev - 8);
         frame = prev;
     }
-    std::fprintf(stderr, "[rb-heap] fight frame %d, %s thread %lu: %s %08X size %X, callers %08X %08X %08X %08X\n", g_fightRun, who, t,
+    std::fprintf(stderr, "[rb-heap] fight frame %d, %s thread %u: %s %08X size %X, callers %08X %08X %08X %08X\n", g_fightRun, who, t,
                  alloc ? "alloc" : "free", ptr, size, chain[0], chain[1], chain[2], chain[3]);
 }
 
@@ -3097,7 +3129,7 @@ void RollbackHeapOp(bool alloc, uint32_t ptr, uint32_t size, const PPCContext& c
 // "foreign" in one fight and their 89 pages were never rewound).
 void RollbackNoteForeignThread()
 {
-    if (hitch::GuestEntryOfThread(GetCurrentThreadId()) == 0) NoteForeignThread("a host thread running a guest callback");
+    if (hitch::GuestEntryOfThread(host_thread::CurrentId()) == 0) NoteForeignThread("a host thread running a guest callback");
 }
 
 void SessionTraceTick(bool start);   // rollback_session.cpp (TTT2_RB_NACETRACE)
@@ -3135,8 +3167,8 @@ bool JobTraceOn()
 void RollbackJobTrace(const char* what, uint32_t obj, bool after)
 {
     if (!JobTraceOn() || g_fightRun < CalibrateFrom() + kCalibrateFrames || g_fightRun > CalibrateFrom() + kCalibrateFrames + 6) return;
-    std::fprintf(stderr, "[jobtrace] frame %llu %s %s obj %08X group+8=%u%s thread %lu\n", (unsigned long long)g_frame,
-                 g_inUpdate ? "update" : "draw", what, obj, GRead32(g_base, kJobGroup + 8), after ? " (after)" : "", GetCurrentThreadId());
+    std::fprintf(stderr, "[jobtrace] frame %llu %s %s obj %08X group+8=%u%s thread %u\n", (unsigned long long)g_frame,
+                 g_inUpdate ? "update" : "draw", what, obj, GRead32(g_base, kJobGroup + 8), after ? " (after)" : "", host_thread::CurrentId());
 }
 
 // D3D's swap throttle: the frame kick waits until the GPU fence of the previous frame passed. It also
@@ -3192,14 +3224,14 @@ int HavokMode()   // 0 frame threads + islands, 1 foreign (old), 2 frame threads
     return v;
 }
 std::mutex g_hkMutex;
-struct HkRouter { uint32_t addr; DWORD tid; uint32_t entry; bool adopted; };
+struct HkRouter { uint32_t addr; uint32_t tid; uint32_t entry; bool adopted; };
 std::vector<HkRouter> g_hkRouters;              // under g_hkMutex
 std::atomic<bool> g_hkPending{ false };
-std::atomic<DWORD> g_hkWorkers[8];
+std::atomic<uint32_t> g_hkWorkers[8];
 std::atomic<int> g_hkWorkerCount{ 0 };
 std::atomic<uint64_t> g_hkRuns{ 0 }, g_hkRunsResim{ 0 };
 std::atomic<int> g_hkFirstRun{ -1 };            // fight update of the workers' first job run after calibration
-bool IsHavokWorker(DWORD t)
+bool IsHavokWorker(uint32_t t)
 {
     const int n = (std::min)(g_hkWorkerCount.load(), 8);
     for (int i = 0; i < n; ++i) if (g_hkWorkers[i].load() == t) return true;
@@ -3218,7 +3250,7 @@ void AdoptPendingIslands()
         if (r.adopted || !g_excluded[r.addr >> 12]) continue;
         r.adopted = true;
         g_islands.push_back({ r.addr, kHkLifoBytes });
-        std::fprintf(stderr, "[rb-hk] Havok memory router %08X of thread %lu (entry %08X) is on its stack: rewound with each snapshot\n",
+        std::fprintf(stderr, "[rb-hk] Havok memory router %08X of thread %u (entry %08X) is on its stack: rewound with each snapshot\n",
                      r.addr, r.tid, r.entry);
     }
 }
@@ -3303,15 +3335,15 @@ PPC_FUNC(sub_82C7B7E8)
 {
     if (HavokMode() == 1) NoteForeignThread();
     const int i = g_hkWorkerCount.fetch_add(1);
-    if (i < 8) g_hkWorkers[i].store(GetCurrentThreadId());
-    std::fprintf(stderr, "[rb-hk] thread %lu is one of Havok's job-pool workers: %s\n", GetCurrentThreadId(),
+    if (i < 8) g_hkWorkers[i].store(host_thread::CurrentId());
+    std::fprintf(stderr, "[rb-hk] thread %u is one of Havok's job-pool workers: %s\n", host_thread::CurrentId(),
                  HavokMode() == 1 ? "on its own timeline" : "the frame's");
     __imp__sub_82C7B7E8(ctx, base);
 }
 extern "C" PPC_FUNC(__imp__sub_82C78918);
 PPC_FUNC(sub_82C78918)   // processAllJobs (the workers' and the stepping thread's)
 {
-    const bool worker = IsHavokWorker(GetCurrentThreadId());
+    const bool worker = IsHavokWorker(host_thread::CurrentId());
     if (worker)
     {
         if (HavokMode() != 1) g_hkBusy.fetch_add(1);
@@ -3327,13 +3359,13 @@ PPC_FUNC(sub_82C78918)   // processAllJobs (the workers' and the stepping thread
 extern "C" PPC_FUNC(__imp__sub_828C1600);
 PPC_FUNC(sub_828C1600)   // hkBaseSystem::initThread(router)
 {
-    const DWORD tid = GetCurrentThreadId();
+    const uint32_t tid = host_thread::CurrentId();
     {
         std::lock_guard l(g_hkMutex);
         g_hkRouters.push_back({ ctx.r3.u32, tid, hitch::GuestEntryOfThread(tid), false });
         g_hkPending = true;
     }
-    std::fprintf(stderr, "[rb-hk] thread %lu (entry %08X) sets up Havok memory router %08X\n", tid, hitch::GuestEntryOfThread(tid), ctx.r3.u32);
+    std::fprintf(stderr, "[rb-hk] thread %u (entry %08X) sets up Havok memory router %08X\n", tid, hitch::GuestEntryOfThread(tid), ctx.r3.u32);
     __imp__sub_828C1600(ctx, base);
 }
 PPC_FUNC(sub_823D94B8)
@@ -3352,8 +3384,8 @@ PPC_FUNC(sub_823D94B8)
             chain[i] = GRead32(g_base, prev - 8);
             sp = prev;
         }
-        std::fprintf(stderr, "[rb] sub_823D94B8 on thread %lu (entry %08X), callers %08X %08X %08X %08X %08X %08X\n", GetCurrentThreadId(),
-                     hitch::GuestEntryOfThread(GetCurrentThreadId()), chain[0], chain[1], chain[2], chain[3], chain[4], chain[5]);
+        std::fprintf(stderr, "[rb] sub_823D94B8 on thread %u (entry %08X), callers %08X %08X %08X %08X %08X %08X\n", host_thread::CurrentId(),
+                     hitch::GuestEntryOfThread(host_thread::CurrentId()), chain[0], chain[1], chain[2], chain[3], chain[4], chain[5]);
     }
     NoteForeignThread();
     __imp__sub_823D94B8(ctx, base);
@@ -3378,7 +3410,7 @@ PPC_FUNC(sub_823D9280)
 {
     if (t_loaderInGetNext && t_loaderSlot < 0 && GRead32(base, ctx.r3.u32) != 0)
     {
-        const unsigned long tid = GetCurrentThreadId();
+        const unsigned long tid = host_thread::CurrentId();
         g_loaderBusy.fetch_add(1);
         for (int i = 0; i < 8; ++i)
         {
@@ -3407,7 +3439,7 @@ PPC_FUNC(sub_82AD1A48)
     if (RollbackInResimDraw()) { ++g_throttleSkips; return; }
     const auto t = std::chrono::steady_clock::now();
     __imp__sub_82AD1A48(ctx, base);
-    if (GetCurrentThreadId() == g_mainTid) g_fp.vblankMs += Ms(t, std::chrono::steady_clock::now());
+    if (host_thread::CurrentId() == g_mainTid) g_fp.vblankMs += Ms(t, std::chrono::steady_clock::now());
 }
 // The same wait for "past the target" (the frame kick's other vblank wait).
 PPC_FUNC(sub_82AD1AD0)
@@ -3415,7 +3447,7 @@ PPC_FUNC(sub_82AD1AD0)
     if (RollbackInResimDraw()) { ++g_throttleSkips; return; }
     const auto t = std::chrono::steady_clock::now();
     __imp__sub_82AD1AD0(ctx, base);
-    if (GetCurrentThreadId() == g_mainTid) g_fp.vblankMs += Ms(t, std::chrono::steady_clock::now());
+    if (host_thread::CurrentId() == g_mainTid) g_fp.vblankMs += Ms(t, std::chrono::steady_clock::now());
 }
 
 // The fight's inputs from outside the state: a pad slot's buttons (sub_822745B0: the local pad, or
@@ -3485,9 +3517,9 @@ thread_local int t_netWriting = 0;
 bool RollbackNetWriting() { return t_netWriting > 0 && NetWordsOn(); }
 std::map<uint32_t, std::vector<uint8_t>> g_netBefore;          // under g_cowLock: pages it opened this call
 std::map<uint32_t, std::array<uint64_t, 8>> g_netWords;        // words it changed (one bit per 8 bytes)
-void NetNoteFaultLocked(uint32_t page)                         // OpenPageLocked, attributing
+void NetNoteFaultLocked(uint32_t page, uint32_t tid, bool net)                         // OpenPageLocked, attributing
 {
-    if (!t_netWriting || GetCurrentThreadId() != g_mainTid || g_netBefore.count(page)) return;
+    if (!net || tid != g_mainTid || g_netBefore.count(page)) return;
     g_netBefore[page].assign(g_base + page, g_base + page + kPage);
 }
 void ClearNetWords() { g_netWords.clear(); }
@@ -3530,7 +3562,7 @@ void ApplyNetWords()                                           // calibration's 
 extern "C" PPC_FUNC(__imp__sub_8266D8C0);
 PPC_FUNC(sub_8266D8C0)
 {
-    const bool learn = NetWordsOn() && g_base && g_attributing.load(std::memory_order_acquire) && GetCurrentThreadId() == g_mainTid;
+    const bool learn = NetWordsOn() && g_base && g_attributing.load(std::memory_order_acquire) && host_thread::CurrentId() == g_mainTid;
     NetTeardownWatch();
     if (learn) ReprotectTouched();                 // pages the update / draw opened this frame fault again
     ++t_netWriting;
@@ -3538,9 +3570,9 @@ PPC_FUNC(sub_8266D8C0)
     --t_netWriting;
     if (!learn) return;
     std::map<uint32_t, std::vector<uint8_t>> before;
-    AcquireSRWLockExclusive(&g_cowLock);
+    g_cowLock.lock();
     before.swap(g_netBefore);
-    ReleaseSRWLockExclusive(&g_cowLock);
+    g_cowLock.unlock();
     for (const auto& [p, b] : before)
     {
         std::array<uint64_t, 8>& bits = g_netWords[p];
@@ -3558,11 +3590,11 @@ PPC_FUNC(sub_825EF0B8)
     if (!g_foreignOpens.empty())
     {
         std::vector<ForeignOpen> opens;
-        AcquireSRWLockExclusive(&g_cowLock);
+        g_cowLock.lock();
         opens.swap(g_foreignOpens);
-        ReleaseSRWLockExclusive(&g_cowLock);
+        g_cowLock.unlock();
         for (const ForeignOpen& o : opens)
-            std::fprintf(stderr, "[rb] page %08X first written after calibration by a foreign thread %lu (entry %08X, lr %08X): never rewound\n",
+            std::fprintf(stderr, "[rb] page %08X first written after calibration by a foreign thread %u (entry %08X, lr %08X): never rewound\n",
                          o.page, o.tid, o.entry, o.lr);
     }
     if (MachineryOn())
@@ -3617,15 +3649,15 @@ PPC_FUNC(sub_825EF0B8)
             return std::pair<int, int>{ ms, every };
         }();
         if (here && slow.first > 0 && slow.second > 0 && g_fightRun % slow.second == 0 && GRead32(g_base, 0x82EAC03Cu) == 4)
-            Sleep(DWORD(slow.first));
+            RollbackSleep(uint32_t(slow.first));
         if (here && hitch.second > 0 && g_fightRun == hitch.first)
         {
             std::fprintf(stderr, "[rb] test hitch: the main thread sleeps %d ms at fight update %d\n", hitch.second, g_fightRun);
-            Sleep(DWORD(hitch.second));
+            RollbackSleep(uint32_t(hitch.second));
         }
     }
     const PPCContext entry = ctx;
-    g_mainTid = GetCurrentThreadId();
+    g_mainTid = host_thread::CurrentId();
     ++g_updates;
     CheckJobLocks("at an update start");
     const auto t0 = std::chrono::steady_clock::now();
