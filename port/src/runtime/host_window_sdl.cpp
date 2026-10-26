@@ -8,6 +8,7 @@
 #include <SDL3/SDL.h>
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <new>
 #ifdef __ANDROID__
 #include <chrono>
@@ -97,6 +98,14 @@ Window* Open(uint32_t width, uint32_t height)
         SDL_QuitSubSystem(SDL_INIT_VIDEO);
         return nullptr;
     }
+#ifndef __ANDROID__
+    // TTT2_WINDOW_AT=x,y (tests): open on another monitor; windowed mode then centres the window on that monitor
+    // (ApplyMode uses the window's display), as the Win32 window did.
+    if (const char* at = std::getenv("TTT2_WINDOW_AT")) {
+        int x = 0, y = 0;
+        if (std::sscanf(at, "%d,%d", &x, &y) == 2) { SDL_SetWindowPosition(handle, x, y); SDL_SyncWindow(handle); }
+    }
+#endif
     Window* window = new (std::nothrow) Window{handle};
     if (!window) {
         SDL_DestroyWindow(handle);

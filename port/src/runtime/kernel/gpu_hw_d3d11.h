@@ -1242,6 +1242,9 @@ public:
         GpuTimerFrameEnd();
         const auto [interval, presentFlags] = PresentMode(noWait);
         HRESULT hr = (toggle_ & 16) ? S_OK : swapchain_->Present(interval, presentFlags);
+        // A flip-model Present unbinds the back buffer from the pipeline behind BindRenderTargets' back: without this, a
+        // present with no game draw since the last one skipped the bind, drew nowhere and showed only the black clear.
+        targetBindingValid_ = false;
         GpuTimerFrameBegin();
         const auto t4 = clock::now();
         frame_pacing_probe::Present(frame_pacing_probe::Ms(t4 - t3));
@@ -3353,7 +3356,10 @@ public:
                     if (!t.unsupported.empty()) { ++untranslatable; ++done; continue; }
                     char name[64];
                     std::error_code e2;
-                    const unsigned variants = HasTextureStateVariants(t) ? 3u : 1u;
+                    // The generic shader only: 5 minutes of arcade used 1-8 of the ~6,400 texture-state variants, which
+                    // doubled the install step. A variant builds in the background the first time a draw wants it
+                    // (TextureStatePixelShader; the generic shader draws meanwhile) and is cached for the next run.
+                    const unsigned variants = 1u;
                     for (unsigned variant = 0; variant < variants; ++variant)
                     {
                         const std::string hlsl = PixelShaderHlsl(t, static_cast<TextureStateVariant>(variant));
