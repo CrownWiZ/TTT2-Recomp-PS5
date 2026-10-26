@@ -41,6 +41,47 @@ std::vector<uint32_t> g_openList;            // alias * CHUNKS + chunk
 std::atomic<uint32_t> g_generation{ 0 };     // bumped by every invalidation
 std::atomic<uint64_t> g_fills{ 0 }, g_writeBacks{ 0 };
 
+// TTT2_MIRRORDUMP=<physStart>,<physSize> (hex, e.g. 07150000,00400000): the first Fill of
+// every chunk inside the range writes the A view bytes (the physical truth the alias would
+// copy) to port/tex/mirrorA_<addr>.raw and logs it. Diagnostic for the stage-texture bake:
+// shows what the CPU recompressors read from their resolved render targets.
+struct MirrorDump
+{
+    bool enabled = false, parsed = false;
+    uint32_t start = 0, size = 0;
+    std::vector<uint8_t> dumped;   // per chunk
+    void Parse()
+    {
+        parsed = true;
+        const char* e = std::getenv("TTT2_MIRRORDUMP");
+        if (!e) return;
+        unsigned long long s = 0, n = 0;
+        if (std::sscanf(e, "%llx,%llx", &s, &n) != 2) return;
+        start = uint32_t(s) & 0x1FFFFFFFu;
+        size = uint32_t(n);
+        dumped.assign(CHUNKS, 0);
+        const uint32_t first = start / CHUNK, last = (start + size - 1) / CHUNK;
+        std::fprintf(stderr, "[phys-mirror] dump enabled: chunks %05X..%05X\n", first, last);
+        enabled = true;
+    }
+    void OnFill(uint32_t chunk, const uint8_t* a)
+    {
+        if (!parsed) Parse();
+        if (!enabled || chunk >= dumped.size() || dumped[chunk]) return;
+        dumped[chunk] = 1;
+        const uint32_t addr = VIEW_A + chunk * CHUNK;
+        char path[128];
+        std::snprintf(path, sizeof(path), "port/tex/mirrorA_%08X.raw", addr);
+        if (FILE* f = std::fopen(path, "wb"))
+        {
+            std::fwrite(a, 1, CHUNK, f);
+            std::fclose(f);
+        }
+        std::fprintf(stderr, "[phys-mirror] dumped A %08X head=%02X %02X %02X %02X %02X %02X %02X %02X\n",
+                     addr, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
+    }
+} g_mirrorDump;
+
 uint8_t* AliasView(unsigned alias, uint32_t chunk)
 {
     return g_mirrorBase + ALIASES[alias] + size_t(chunk) * CHUNK;
@@ -62,6 +103,7 @@ void Fill(unsigned alias, uint32_t chunk)
 {
     uint8_t* c = AliasView(alias, chunk);
     const uint8_t* a = AView(chunk);
+    g_mirrorDump.OnFill(chunk, a);
     RequireVm(host_vm::FillMirrorView(c, a, CHUNK), "fill cached view", alias, chunk);
     g_open[alias][chunk] = 1;
     if (!g_listed[alias][chunk])

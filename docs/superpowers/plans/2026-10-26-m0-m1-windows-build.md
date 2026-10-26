@@ -40,14 +40,14 @@ Los cinco modos de fallo más probables de esta fase, cada uno con su test:
 - Consumes: `BUILDING.md` (lista de requisitos exacta).
 - Produces: entorno con las herramientas exactas que Task 2–7 invocan (`cmake`, `ninja`, `clang-cl`, `python` con `Pillow`, msbuild de VS2022).
 
-- [ ] **Step 1: Verificar ruta del checkout sin espacios ni paréntesis**
+- [x] **Step 1: Verificar ruta del checkout sin espacios ni paréntesis**
 
 ```powershell
 Test-Path C:\ttt2; git -C C:\ttt2 status --porcelain
 ```
 Expected: `True` + árbol limpio.
 
-- [ ] **Step 2: Auditar herramientas presentes: versiones o ausencias**
+- [x] **Step 2: Auditar herramientas presentes: versiones o ausencias**
 
 ```powershell
 foreach ($t in 'python','cmake','ninja','clang-cl') { & $t --version 2>$null | Select-Object -First 1 }
@@ -56,11 +56,11 @@ python -c "import PIL; print('Pillow', PIL.__version__)" 2>$null
 ```
 Expected: listado real por herramienta, o ausencia. Guardar resultados en `docs/superpowers/env-audit.md`.
 
-- [ ] **Step 3: Instalar lo que falte (acción: instalador de VS2022 Build Tools con workload C++ x64 + componente “C++ Clang tools for Windows”; winget puede servir para CMake/Ninja/LLVM/Python)**
+- [x] **Step 3: Instalar lo que falte (acción: instalador de VS2022 Build Tools con workload C++ x64 + componente “C++ Clang tools for Windows”; winget puede servir para CMake/Ninja/LLVM/Python)**
 
 Instalar sin ejecutar el juego; documentar en `env-audit.md` qué se instaló y su versión exacta.
 
-- [ ] **Step 4: Re-auditar y comprobar que las 5 herramientas responden**
+- [x] **Step 4: Re-auditar y comprobar que las 5 herramientas responden**
 
 ```powershell
 cmake --version; ninja --version; clang-cl --version
@@ -69,7 +69,7 @@ where.exe msbuild | Select-Object -First 1
 ```
 Expected: todas las versiones impresas, sin error.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add docs/superpowers/env-audit.md && git commit -m "chore(m1): registro de auditoría del entorno de build"
@@ -86,23 +86,23 @@ git add docs/superpowers/env-audit.md && git commit -m "chore(m1): registro de a
 - Consumes: imagen del disco del usuario + Title Update 3 (el tu requerido es `TU_174Q22P_0000008000000.00000000000O2`, termina en «O2»).
 - Produces: `re\extracted_tu\` completo (el recomp y el instalador de Task 4–7 lo leen).
 
-- [ ] **Step 1: El usuario copia (acción humana)**: su `Default.xex` (extraído del ISO con el flujo habitual del scene o del disco ya capturado por el upstream) a `C:\ttt2\re\Default.xex`, y el TU3 a `C:\ttt2\Updates\`.
+- [x] **Step 1: El usuario copia (acción humana)**: su `Default.xex` (extraído del ISO con el flujo habitual del scene o del disco ya capturado por el upstream) a `C:\ttt2\re\Default.xex`, y el TU3 a `C:\ttt2\Updates\`.
 
-- [ ] **Step 2: Extraer con la herramienta del upstream**
+- [x] **Step 2: Extraer con la herramienta del upstream**
 
 ```powershell
 cd C:\ttt2; python port\tools\stfs.py re\Default.xex Updates re\extracted_tu
 ```
 (La firma exacta del invocable `stfs.py` se confirma leyendo su `--help` antes de correr; el objetivo es: consumir los archivos de arriba y poblar `re\extracted_tu\`.)
 
-- [ ] **Step 3: Verificar extracción completa**
+- [x] **Step 3: Verificar extracción completa**
 
 ```powershell
 (Get-ChildItem C:\ttt2\re\extracted_tu -Recurse -File).Count
 ```
 Expected: > 0 archivos y NO vacío; el script no imprime error de región o de TU inválido. Si falla: revisar con el usuario la región del disco (debe ser USA/EU) y que el TU sea el 3.
 
-- [ ] **Step 4: Sin commit (datos del usuario).** Registrar en `env-audit.md` que los archivos existen y están excluidos por `.gitignore`.
+- [x] **Step 4: Sin commit (datos del usuario).** Registrar en `env-audit.md` que los archivos existen y están excluidos por `.gitignore`.
 
 ---
 
@@ -115,7 +115,7 @@ Expected: > 0 archivos y NO vacío; el script no imprime error de región o de T
 - Consumes: `tools\patches\XenonRecomp.patch`, commit objetivo `ddd128b` de `hedge-dev/XenonRecomp`.
 - Produces: el binario del recompilador que Task 4 invoca: `tools\XenonRecomp\XenonRecomp.exe` y `XenonUtils\ppc_context.h`.
 
-- [ ] **Step 1: Clonar y anclar el commit**
+- [x] **Step 1: Clonar y anclar el commit**
 
 ```powershell
 git clone --recursive https://github.com/hedge-dev/XenonRecomp tools\XenonRecomp
@@ -123,21 +123,21 @@ git -C tools\XenonRecomp checkout ddd128b
 ```
 Expected: checkout sin conflicto.
 
-- [ ] **Step 2: Aplicar el parche del upstream**
+- [x] **Step 2: Aplicar el parche del upstream**
 
 ```powershell
 git -C tools\XenonRecomp apply ..\patches\XenonRecomp.patch
 ```
 Expected: aplica limpio; si hay conflicto, es señal de commit equivocado (revisar `ddd128b`).
 
-- [ ] **Step 3: Compilar**
+- [x] **Step 3: Compilar**
 
 ```powershell
 cd C:\ttt2; .\tools\build_xenonrecomp.cmd
 ```
 Expected: proceso concluye; `tools\XenonRecomp\XenonRecomp.exe` existe (`Test-Path`).
 
-- [ ] **Step 4: Commit (el checkout es de terceros, queda excluido por .gitignore del upstream si procede; registrar fine en `env-audit.md` que el parche aplicó en `ddd128b`)**
+- [x] **Step 4: Commit (el checkout es de terceros, queda excluido por .gitignore del upstream si procede; registrar fine en `env-audit.md` que el parche aplicó en `ddd128b`)**
 
 ---
 
@@ -150,7 +150,7 @@ Expected: proceso concluye; `tools\XenonRecomp\XenonRecomp.exe` existe (`Test-Pa
 - Consumes: `tools\XenonRecomp\XenonRecomp.exe` (Task 3), `re\recomp\tekken.toml`, `re\Default.xex` + TU aplicado (Task 2).
 - Produces: `re\ppc\` con el C++ generado sin ningún sitio `// ERROR` — prerrequisito del build (Task 6).
 
-- [ ] **Step 1: Análisis del XEX parcheado (TU3) y generación de switches que faltan**
+- [x] **Step 1: Análisis del XEX parcheado (TU3) y generación de switches que faltan**
 
 ```powershell
 cd C:\ttt2
@@ -159,13 +159,13 @@ python port\tools\gen_missing_switches.py
 ```
 Expected: `re\ppc\` empieza a poblarse; scripts salen sin traceback.
 
-- [ ] **Step 2: Ejecutar la recompilación**
+- [x] **Step 2: Ejecutar la recompilación**
 
 ```powershell
 tools\XenonRecomp\XenonRecomp.exe re\recomp\tekken.toml tools\XenonRecomp\XenonUtils\ppc_context.h
 ```
 
-- [ ] **Step 3: Iterar faltantes hasta cero**
+- [x] **Step 3: Iterar faltantes hasta cero**
 
 ```powershell
 python port\tools\gen_missing_functions.py
@@ -174,7 +174,7 @@ Select-String -Path re\ppc\* -Pattern '// ERROR'
 ```
 Expected: bucle gen → recomp → gen termina cuando `Select-String` devuelve 0 ocurrencias.
 
-- [ ] **Step 4: Los cuatro pasos de post-procesado del BUILDING, en orden, cada uno sin traceback**
+- [x] **Step 4: Los cuatro pasos de post-procesado del BUILDING, en orden, cada uno sin traceback**
 
 ```powershell
 python port\tools\debug_probes.py
@@ -183,7 +183,7 @@ python port\tools\gen_kernel_stubs.py
 ```
 Expected: acceptance report OK; error = detener y depurar (ver Review Focus 4).
 
-- [ ] **Step 5: Commit** — nada que commitear (código generado); registrar el resultado del acceptance en el log de la tarea.
+- [x] **Step 5: Commit** — nada que commitear (código generado); registrar el resultado del acceptance en el log de la tarea.
 
 ---
 
@@ -196,9 +196,9 @@ Expected: acceptance report OK; error = detener y depurar (ver Review Focus 4).
 - Consumes: instrucciones exactas en el encabezado de `port\third_party\ffmpeg_xma\CMakeLists.txt` (abajo de Task 6 lo referencia).
 - Produces: configure listado para el build del game (Task 6 lo enlaza estáticamente).
 
-- [ ] **Step 1: Descargar/extraer la fuente FFmpeg n7.1 a `tools\ffmpeg_dl\FFmpeg-n7.1` (acción automática por git o descarga del tarball oficial n7.1)**
+- [x] **Step 1: Descargar/extraer la fuente FFmpeg n7.1 a `tools\ffmpeg_dl\FFmpeg-n7.1` (acción automática por git o descarga del tarball oficial n7.1)**
 
-- [ ] **Step 2: Aplicar la configuración exigida por el CMakeLists (confirmar flags exactos leyendo el encabezado del archivo en el checkout) y validar que las variables que el CMakeLists espera quedaron definidas**
+- [x] **Step 2: Aplicar la configuración exigida por el CMakeLists (confirmar flags exactos leyendo el encabezado del archivo en el checkout) y validar que las variables que el CMakeLists espera quedaron definidas**
 
 Expected: el CMake de Task 6 no falla con “FFmpeg not found/configured”.
 
@@ -213,7 +213,7 @@ Expected: el CMake de Task 6 no falla con “FFmpeg not found/configured”.
 - Consumes: `re\ppc\` sin errores (Task 4), FFmpeg configurado (Task 5), toolchain (Task 1).
 - Produces: **el binario de referencia para todas las fases** que Task 8 ejecuta; su log stderr es la base de depuración del proyecto.
 
-- [ ] **Step 1: Confirmar el significado de cada flag leyendo `tools\build_port.cmd`, luego ejecutar el build del puerto**
+- [x] **Step 1: Confirmar el significado de cada flag leyendo `tools\build_port.cmd`, luego ejecutar el build del puerto**
 
 ```powershell
 cd C:\ttt2
@@ -222,6 +222,8 @@ cd C:\ttt2
 Nota: `BUILDING.md` usa `build-o1 1 8 ON` con Steamworks instalado; con Steamworks ausente se confirma el flag de Steamworks en el propio script (`ON`/`OFF` o `1`/`0`) y se ejecuta con el valor que desactiva Steam. No se adivina: se lee el script primero.
 
 Expected: build termina; `port\build-o1\tekken_recomp.exe` existe (`Test-Path` → True) y el log de Ninja/MSBuild no tiene errores fatales.
+
+✅ **RESULTADO (2026-10-26):** build exit 0 en `build-o1` (ppc-opt=1) y `build-o2` (ppc-opt=2, 62,019,072 B). El o2 es el binario de rendimiento. Builds vía `tools\build_port_sdl3.cmd` (SDL3 3.4.0 desde fuente + shim `tools\SDL3\shim\cmake\SDL3Config.cmake`). Fin de sesión M1: `TTT2_GPU_HW` pasa a **On por defecto** en `gpu_hw_control.h` (run8/run9: backend D3D11 activo → cinemática fluida, combate disfrutable, ruido del escenario eliminado).
 
 ---
 
@@ -234,18 +236,20 @@ Expected: build termina; `port\build-o1\tekken_recomp.exe` existe (`Test-Path` �
 - Consumes: `build_setup.cmd` (Task 7 genera el instalador) y los datos del usuario (Task 2).
 - Produces: datos de juego válidos (`game\tekken.img`): el juego corre en el PC del usuario.
 
-- [ ] **Step 1: Compilar el instalador**
+- [x] **Step 1: Compilar el instalador**
 
 ```powershell
 cd C:\ttt2; .\tools\build_setup.cmd build-o1 8
 ```
 Expected: `port\build-o1\setup\ttt2_setup.exe` existe.
 
-- [ ] **Step 2: Ejecutar el instalador (acción humana en GUI)**: el usuario lo lanza y apunta su imagen de disco del juego + el TU3.
+- [x] **Step 2: Ejecutar el instalador (acción humana en GUI)**: el usuario lo lanza y apunta su imagen de disco del juego + el TU3.
 
 Expected: el instalador valida la copia (región USA/EU, TU3) y crea `game\tekken.img`; el paso «Preparing the game's shaders» completa sin error.
 
-- [ ] **Step 3: Arranque de validación**
+✅ **RESULTADO (2026-10-26):** instalador en `port\build-o1\setup\ttt2_setup.exe` (+ gemelo asInvoker `ttt2_setup_probe.exe` con CLI `/silent <iso> <tu> <folder>`). Instalación silenciosa validada → `C:\ttt2\install-test\` (todos los dataNNN.bin + update\ + Default.xex; `tekken.img` = 18,612,224 B, tamaño exacto del TU3 parcheado). Nota de diagnóstico: data025/051 instalados difieren del ISO en MD5/tamaño pero son **falsos positivos**: son contenedores LZX que el instalador expande; los tamaños instalados (703,658,432 / 165,763,536 B) son los expandidos de diseño (verificados contra el árbol XDVDFS y el catálogo nrfo: sin corrupción).
+
+- [x] **Step 3: Arranque de validación**
 
 ```powershell
 $env:TTT2_VFS_ROOT = "<ruta de instalación>\game"
@@ -253,7 +257,9 @@ C:\ttt2\port\build-o1\tekken_recomp.exe "<ruta de instalación>\game\tekken.img"
 ```
 Expected: el juego muestra el menú prinicpal; el usuario puede entrar a un combate arcade y ejecutar un round completo. El ejecutable es de consola: su stderr queda en `run.txt` (única evidencia sobre fallos). Criterio de éxito M1: pantalla de menú + un round jugado + VFS logueada sin errores críticos.
 
-- [ ] **Step 4: Sin commit (binarios y datos). Registrar el éxito y la ruta de instalación exacta en el log de la tarea**
+✅ **RESULTADO (2026-10-26, cierre M1):** CUMPLIDO con el binario o2 + backend D3D11 (`TTT2_GPU_HW` = On por defecto tras run9, configuración cero). Evidencia: run9 exit=0, `[gpu-hw] active on NVIDIA GeForce RTX 5070`, shader warm-up 5,644 shaders / 0 failed, audio sin starves, ~406 MB leídos por VFS; el usuario jugó **dos combates completos sin ruido ni stutter** ("es disfrutable", "el ruido ni rastro"). Diagnóstico de la sesión: el ruido DXT2_3 del escenario y la lentitud/CPU 80% provenían del **rasterizador de software por defecto** (intérprete de shaders); el instalador y los datos del disco quedaron descartados como causa.
+
+- [x] **Step 4: Sin commit (binarios y datos). Registrar el éxito y la ruta de instalación exacta en el log de la tarea** — ruta: `C:\ttt2\install-test\game\`; ejecutable de referencia: `C:\ttt2\port\build-o2\tekken_recomp.exe`.
 
 ---
 
@@ -266,19 +272,32 @@ Expected: el juego muestra el menú prinicpal; el usuario puede entrar a un comb
 - Consumes: recorridos mencionados en el spec M0 (`port\src\runtime\` y scripts Android `tools\build_android_*.sh`).
 - Produces: cultura común de Task M3+: el informe lista qué archivos son kernel host y qué sustituciones exige el caso PS5 (activar para escanear antes de escribir M3).
 
-- [ ] **Step 1: Inventario**
+- [x] **Step 1: Inventario**
 
 ```powershell
 Get-ChildItem C:\ttt2\port\src\runtime -Recurse -File | Select-Object FullName
 Get-ChildItem C:\ttt2\tools -Filter "build_android_*.sh" | Select-Object Name
 ```
 
-- [ ] **Step 2: Clasificar en el informe cada archivo host en trazado X (reutilizable tal cual para PS5) / Y (sustitutable con patrón existente en el upstream, e.g. `*_android*` → `*_ps5`) / Z (exclusivo Windows, poco probable)**. Anotar para cada Y el patrón fuente (Linux o Android) — es la lista base de planificación del M3.
+- [x] **Step 2: Clasificar en el informe cada archivo host en trazado X (reutilizable tal cual para PS5) / Y (sustitutable con patrón existente en el upstream, e.g. `*_android*` → `*_ps5`) / Z (exclusivo Windows, poco probable)**. Anotar para cada Y el patrón fuente (Linux o Android) — es la lista base de planificación del M3.
 
-- [ ] **Step 3: Commit del informe**
+- [x] **Step 3: Commit del informe**
 
 ```bash
 git add docs/superpowers/m0-platform-surface.md && git commit -m "docs(m0): informe de superficie de host-por-plataforma"
 ```
 
 **Criterio de cierre M0+M1:** juego corriendo en el PC del usuario (Task 7) + informe de plataforma (Task 8) + entorno/auditoría registrada (Task 1).
+
+---
+
+## Cierre M0+M1 (2026-10-26)
+
+**Criterio de cierre CUMPLIDO**: juego corriendo en el PC del usuario (Task 7, dos combates completos jugados por el usuario, it is enjoyable / el ruido ni rastro) + informe de plataforma (Task 8, docs/superpowers/m0-platform-surface.md, commit 738b7b4) + entorno registrado (Task 1, env-audit.md).
+
+### Hallazgos de la sesión de validación (resumen para las fases PS5)
+
+1. **El pipeline real del port es el backendhardware D3D11** (gpu_hw_d3d11.*): TTT2_GPU_HW no definido deja el intérprete de shaders en CPU (80% CPU, GPU idle, cinemáticas sin animar, ruido DXT2_3 en escenarios, DXT4_5/DXT1 funcionando). Con TTT2_GPU_HW=1: RTX 5070 activa, cinematica animada, combates fluidos, **ruido del escenario eliminado por completo** (runs 8-9). Cambio aplicado: RequestedMode() en gpu_hw_control.h devuelve Mode::On por defecto (=0 hace fallback al intérprete). Implicación M4: en PS5 el backend equivalente va sobre DXVK-native/RADV; no reutilizar el path CPU para el objetivo.
+2. **El instalador no corrompe datos**: data025/051 difieren del ISO porque son contenedores LZX expandidos en instalación (nrfo/ofsd); tamaños instalados = los expandidos de diseño. Falsa alarma arqueada con hashes + árbol XDVDFS.
+3. **Herramientas de diagnóstico añadidas** (gated por env, apagadas de serie): TTT2_MIRRORDUMP=<start>,<size> en phys_mirror.cpp (dump del contenido físico A de chunks cacheados), TTT2_TEXRAW, TEXDUMP/FRAMETIME previos. Logs de las corridas: run5-run9 en C:\ttt2\.
+4. **Build de rendimiento** = ppc-opt 2 (uild-o2); el o1 queda como build de referencia de Task 6. Binario validado final: port/build-o2/tekken_recomp.exe + instalación C:\ttt2\install-test\game\.

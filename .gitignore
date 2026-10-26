@@ -66,6 +66,7 @@ re/ghidra/
 port/gen/
 *.gen.cpp
 *.gen.h
+*.gen.imports.json
 shader_cache.*
 
 # --- Build output ---

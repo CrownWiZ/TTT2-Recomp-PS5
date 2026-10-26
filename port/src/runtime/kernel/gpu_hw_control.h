@@ -16,14 +16,19 @@ namespace ttt2_hw {
 
 // Runtime selection and failure isolation are shared by host GPU backends.
 // A backend must provide ReportBackendFailure after its Get() function.
+// The hardware D3D11 backend is the default pipeline: the CPU shader interpreter only
+// exists for bring-up and diagnosis (its texture path misrendered DXT2_3 stage data and
+// it starves the streaming threads at ~80% CPU - validated 2026-10-26, run8). TTT2_GPU_HW
+// =0 forces the interpreter back, =compare keeps the A/B mode.
 inline Mode RequestedMode()
 {
     static const Mode mode = [] {
         const char* e = std::getenv("TTT2_GPU_HW");
-        if (!e) return Mode::Off;
+        if (!e) return Mode::On;
+        if (std::strcmp(e, "0") == 0) return Mode::Off;
         if (std::strcmp(e, "1") == 0) return Mode::On;
         if (std::strcmp(e, "compare") == 0) return Mode::Compare;
-        return Mode::Off;
+        return Mode::On;
     }();
     return mode;
 }

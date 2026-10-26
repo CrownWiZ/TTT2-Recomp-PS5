@@ -950,6 +950,26 @@ void DumpTextureBmp(const Texture& t)
     }
     std::fclose(f);
     std::fprintf(stderr, "[tex] dumped %s pitch=%u tiled=%d\n", path.c_str(), t.pitch, (int)t.tiled);
+    // TTT2_TEXRAW=1: alongside the decoded bmp, write the texture's guest bytes verbatim
+    // (decoded below by an independent reference decoder, so a mismatch separates an
+    // upload-memory bug from a decode bug). Trivially cheap; only for diagnosis runs.
+    static const bool rawOn = std::getenv("TTT2_TEXRAW") != nullptr;
+    if (rawOn)
+    {
+        const uint32_t guestBytes = TextureGuestBytes(t, 1);
+        if (guestBytes && uint64_t(t.base) + guestBytes <= (1ull << 32) && g_base + t.base)
+        {
+            char rawName[100];
+            std::snprintf(rawName, sizeof(rawName), "%08X_%ux%u_f%u.raw", t.base, t.width, t.height, t.format);
+            FILE* rf = std::fopen((std::filesystem::path(directory) / rawName).string().c_str(), "wb");
+            if (rf)
+            {
+                std::fwrite(g_base + t.base, 1, guestBytes, rf);
+                std::fclose(rf);
+                std::fprintf(stderr, "[tex] raw %u bytes\n", guestBytes);
+            }
+        }
+    }
 }
 
 V4 SampleTexture(const Texture& t, float u, float vv, bool bilinear)
