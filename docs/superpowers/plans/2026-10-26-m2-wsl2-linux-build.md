@@ -1,5 +1,7 @@
 # Plan de implementación: M2 — build Linux funcional en WSL2 (DXVK-native + LAVAPIPE)
 
+> **ESTADO: COMPLETADO (26-10-2026).** Ver sección "Cierre M2" al final. Tasks 1-8 ejecutados con result notes; los checkboxes de abajo son el registro original del plan (los desvíos practicados están en las notas del cierre).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Demostrar portabilidad: el port compila como ELF Linux (`tekken_recomp_linux`) y arranca en WSL2 con el pipeline HW real del port (D3D11 → DXVK-native → Vulkan → LAVAPIPE software), descubriendo los mínimos de bibliotecas que M3/M4 reutilizarán en la PS5.
@@ -285,4 +287,36 @@ Expected: idéntico al pre-run (registrar el valor antes del Step 2).
 
 ---
 
-**Criterio de cierre M2:** `tekken_recomp_linux` construido por el script upstream SIN modificaciones + juego arrancado una vez en WSL2 con LAVAPIPE (menú visible, sin crash, datos intactos) + hallazgos documentados en el ledger (cada biblioteca que faltó en apt y cada override necesario es un hallazgo directo para M3/M4).
+## Cierre M2 (26-10-2026)
+
+**Resultado del hito: COMPLETADO.** `tekken_recomp_linux` (ELF x86-64, 100 MB) construido con `tools/build_dxvk11_linux.sh` SIN modificar (603/603 targets), y el juego corriendo en WSL2 con el pipeline HW real del port: D3D11 → DXVK-native → Vulkan 1.3 → LAVAPIPE (llvmpipe, Mesa 25.2.8). Menú principal, navegación por mando virtual scriptado, combate renderizado (hasta ~139k tris/fotograma a ~23 presents/s). Datos de juego intactos tras 5 runs (MD5 pre/post idéntico).
+
+### Desvíos practicados sobre el plan (todos registrados con su porqué)
+
+1. **WSL2 + Ubuntu 24.04 instalado por el agente** (no por el usuario): tras `wsl --update` del usuario (3.0.3.0), `wsl --install -d Ubuntu-24.04 --no-launch` corrió sin necesitar más elevación sobre la sesión del usuario. Task 1 resultó más corto de lo previsto.
+2. **GitHub inalcanzable desde WSL** (network layer): resuelto por espejos — DXVK clona con `TTT2_DXVK_MIRROR` (mirror local en `C:\ttt2\.superpowers\dxvk-native-mirror`, montado desde Windows, donde GitHub sí responde); vkd3d se baja como **tarball oficial de `dl.winehq.org`** (los mirror-github de tags fallaron: prefijo real de tags es `vkd3d-x.y`, y la rama git no trae los headers generados).
+3. **vkd3d elegido: 1.19 (tarball autotools)** — el plan editable decía "1.16/meson" para adaptar: la serie 1.17+ es solo autotools; el tarball trae headers pre-generados. Requiere `libjson-perl`, `mingw-w64-tools` (widl), `autoconf/automake/libtool`, `make` y headers Vulkan de Khronos ≥1.3.228 copiados a `/usr/local/include` (los `libvulkan-dev` de Ubuntu 24.04 son viejos; hay que añadir `vk_video/` también).
+4. **SDL3 instalado además en /usr/local** (lib + `SDL3` headers + `sdl3.pc`): DXVK-native `find_library('SDL3')` usa glibc default paths, no pkg-config; y sus headers de WSI se resuelven con `CPATH=/usr/local/include`. Apta extra del host: `libxtst-dev` (XTest de SDL3).
+5. **FFmpeg**: `--cc=clang --cxx=clang++` (gcc no instalado); el subset exacto de M1 funcionó igual: `--enable-decoder=wmapro,xma1,xma2 --enable-parser=xma` → `CONFIG_XMA2_DECODER/WMAPRO/XMA_PARSER = 1`.
+6. **Layout DXVK `lib64` → symlink `lib`**: meson instaló en `install/lib64`; el script upstream y el CMake esperan `install/lib`. Symlink en vez de tocar scripts (constraint del plan respetado).
+7. **OpenSSL dev necesario** en el host (`libssl-dev`, find_package OpenSSL 3.0 en `port/CMakeLists.txt:35`).
+8. **Interacción de shell PS↔bash aprendida (a ledger)**: `$var` y `\$var` en one-liners se engullen entre capas — los scripts .sh van SIEMPRE por fichero en `.superpowers` + `tr -d '\r'` explícito por fichero, con nombres explícitos (el `tr` con backslash mal escapado borra todas las 'r' del fichero destino — diagnóstico por `od -c`).
+
+### Hallazgos portables (input para M3/M4)
+
+- **F1 (bug core del port, A/B confirmado por el usuario): saltar las cinemáticas/attract deja la voz de audio en loop** — Windows también lo hacía "antes" (verificación A/B del usuario). El decodificador honra el bit de loop del contexto XMA y el port nunca observa un reset/abort del stream (`resets=0` en toda la sesión en Linux). Pista nº 1: wiring de abort/stop de voz (contextos XMA2 en A0001000, mecanismo de reset del juego) — reparable en el port con beneficio directo PC/PS5.
+- **F2 (Linux/WSL): el streaming de audio del menú-idle se atasca tras el logo** (anillo XMA lleno, consumidor parado, counters congelados en 2048); en gameplay con avance del flujo el audio fluyó (kicks 23k+, loops de música creciendo). WSLg→Windows el trayecto de audio es correcto (el logo sonó). Investigación con `TTT2_XMA_LOG=1` pendiente — el pad virtual (`TTT2_SDL_TEST_PAD_SCRIPT=<ms>:<BTN>:<hold>,...`) permite reproducirlo sin input físico.
+- **F3 (a clasificar): el usuario reportó "buggeado al escoger equipo"** — captura pendiente en qué plataforma y qué síntoma exacto (congelación/texturas/no-responde).
+- **F4 (estructura WSL2)**: el USB/HID de Windows no llega a WSL2 sin `usbipd-win` — el mando físico no puede control el juego ahí; el pad virtual scriptado cubre las pruebas (y el teclado no está mapeado: el host input Linux es SDL_Gamepad-only).
+- **Rendimiento en software Vulkan aceptable**: menú ~30-40 presents/s, combate ~22-23, GPU llvmpipe consume ~3.5-6 cores. En PS5 (RADV hardware) sobra.
+
+### Evidencia
+
+- Logs: `.superpowers/m2-wsl-run{1,2,3,4,5w}.log` (run1: boot+menú+audio-stall; run2: pad virtual + audio en gameplay; run3/run4: secuencias; run5w: ventana limpia del usuario, cinemática attract audible, loop al saltar, bugeo en selección de equipo).
+- Binarios: `~/.cache/ttt2-platform/build-shared-linux/tekken_recomp_linux`; dependencias en `~/.cache/ttt2-platform/{vkd3d,sdl3,shared-dxvk}`.
+- Manifest del build: sha de source Linux `af44c09e...` + DXVK `c362b402...`.
+
+### M2 → M3/M4
+
+- El **pipeline exacto de PS5 ya está compilado y vivo en Linux** (DXVK-native + vkd3d + SDL3 + FFmpeg XMA): M3/M4 solo cambian el host (env `-ps5`) manteniendo esta combinación de bibliotecas.
+- Los fallos de red de WSL against GitHub obligan a M3/M4 a tener todos los tarballs/mirrors **locales** antes del cross-build.
