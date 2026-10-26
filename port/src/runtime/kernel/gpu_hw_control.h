@@ -25,7 +25,8 @@ inline Mode RequestedMode()
     static const Mode mode = [] {
         const char* e = std::getenv("TTT2_GPU_HW");
         if (!e) return Mode::On;
-        if (std::strcmp(e, "0") == 0) return Mode::Off;
+        if (std::strcmp(e, "0") == 0 || std::strcmp(e, "false") == 0 ||
+            std::strcmp(e, "off") == 0) return Mode::Off;
         if (std::strcmp(e, "1") == 0) return Mode::On;
         if (std::strcmp(e, "compare") == 0) return Mode::Compare;
         return Mode::On;

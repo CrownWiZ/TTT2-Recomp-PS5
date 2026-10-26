@@ -18,12 +18,14 @@
 #include "phys_mirror.h"
 #include "gpu_render.h"
 #include "../host_vm.h"
+#include "host_settings.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <mutex>
 #include <vector>
 
@@ -41,44 +43,64 @@ std::vector<uint32_t> g_openList;            // alias * CHUNKS + chunk
 std::atomic<uint32_t> g_generation{ 0 };     // bumped by every invalidation
 std::atomic<uint64_t> g_fills{ 0 }, g_writeBacks{ 0 };
 
-// TTT2_MIRRORDUMP=<physStart>,<physSize> (hex, e.g. 07150000,00400000): the first Fill of
-// every chunk inside the range writes the A view bytes (the physical truth the alias would
-// copy) to port/tex/mirrorA_<addr>.raw and logs it. Diagnostic for the stage-texture bake:
-// shows what the CPU recompressors read from their resolved render targets.
+// TTT2_MIRRORDUMP=<physStart>,<physSize> (hex, e.g. 07510000,00400000 for the 1024x1024
+// character-bake resolve): the first Fill of every chunk INSIDE THE RANGE writes the A view
+// bytes (the physical truth the alias would copy) to port/tex/mirrorA_<addr>.raw and logs
+// it. Diagnostic for CPU-bake diagnosis: shows what the CPU recompressors read from their
+// resolved render targets. The write runs under g_mirrorMutex - accepted for a gated,
+// once-per-chunk debug tool (finding from the 1a46b06 review).
 struct MirrorDump
 {
     bool enabled = false, parsed = false;
-    uint32_t start = 0, size = 0;
-    std::vector<uint8_t> dumped;   // per chunk
+    uint32_t firstChunk = 0, lastChunk = 0;
+    std::vector<uint8_t> dumped;   // per chunk, in-range chunks only
+    std::filesystem::path directory;
     void Parse()
     {
         parsed = true;
         const char* e = std::getenv("TTT2_MIRRORDUMP");
         if (!e) return;
         unsigned long long s = 0, n = 0;
-        if (std::sscanf(e, "%llx,%llx", &s, &n) != 2) return;
-        start = uint32_t(s) & 0x1FFFFFFFu;
-        size = uint32_t(n);
-        dumped.assign(CHUNKS, 0);
-        const uint32_t first = start / CHUNK, last = (start + size - 1) / CHUNK;
-        std::fprintf(stderr, "[phys-mirror] dump enabled: chunks %05X..%05X\n", first, last);
+        if (std::sscanf(e, "%llx,%llx", &s, &n) != 2 || n == 0) return;
+        const uint32_t start = uint32_t(s) & 0x1FFFFFFFu;
+        firstChunk = start / CHUNK;
+        lastChunk = (start + uint32_t(n) - 1) / CHUNK;
+        if (firstChunk >= CHUNKS) return;
+        lastChunk = (std::min)(lastChunk, CHUNKS - 1u);
+        dumped.assign(lastChunk - firstChunk + 1, 0);
+        directory =
+#if defined(_WIN32)
+            "C:/ttt2/port/tex";
+#else
+            host_settings::DiagnosticPath("tex");
+#endif
+        std::error_code directoryError;
+        std::filesystem::create_directories(directory, directoryError);
+        if (directoryError) return;
         enabled = true;
+        std::fprintf(stderr, "[phys-mirror] dump enabled: chunks %05X..%05X\n", firstChunk, lastChunk);
     }
     void OnFill(uint32_t chunk, const uint8_t* a)
     {
         if (!parsed) Parse();
-        if (!enabled || chunk >= dumped.size() || dumped[chunk]) return;
-        dumped[chunk] = 1;
+        if (!enabled || chunk < firstChunk || chunk > lastChunk) return;
+        const uint32_t index = chunk - firstChunk;
+        if (dumped[index]) return;
+        dumped[index] = 1;                    // one shot: never retry a failed open either
         const uint32_t addr = VIEW_A + chunk * CHUNK;
         char path[128];
-        std::snprintf(path, sizeof(path), "port/tex/mirrorA_%08X.raw", addr);
-        if (FILE* f = std::fopen(path, "wb"))
+        std::snprintf(path, sizeof(path), "mirrorA_%08X.raw", addr);
+        if (FILE* f = std::fopen((directory / path).string().c_str(), "wb"))
         {
             std::fwrite(a, 1, CHUNK, f);
             std::fclose(f);
+            std::fprintf(stderr, "[phys-mirror] dumped A %08X head=%02X %02X %02X %02X %02X %02X %02X %02X\n",
+                         addr, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
         }
-        std::fprintf(stderr, "[phys-mirror] dumped A %08X head=%02X %02X %02X %02X %02X %02X %02X %02X\n",
-                     addr, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]);
+        else
+        {
+            std::fprintf(stderr, "[phys-mirror] dump FAILED %08X (%s)\n", addr, path);
+        }
     }
 } g_mirrorDump;
 

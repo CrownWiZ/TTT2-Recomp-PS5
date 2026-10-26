@@ -95,6 +95,8 @@ cd C:\ttt2; python port\tools\stfs.py re\Default.xex Updates re\extracted_tu
 ```
 (La firma exacta del invocable `stfs.py` se confirma leyendo su `--help` antes de correr; el objetivo es: consumir los archivos de arriba y poblar `re\extracted_tu\`.)
 
+**Nota (realidad medida — ver ledger):** `stfs.py` NO tiene CLI (`__main__` usa rutas en duro); se invoca como librería (import STFS + leer `Updates/`) sin tocar el upstream. El comportamiento documentado aquí es el objetivo, no la invocación literal.
+
 - [x] **Step 3: Verificar extracción completa**
 
 ```powershell
@@ -136,6 +138,8 @@ Expected: aplica limpio; si hay conflicto, es señal de commit equivocado (revis
 cd C:\ttt2; .\tools\build_xenonrecomp.cmd
 ```
 Expected: proceso concluye; `tools\XenonRecomp\XenonRecomp.exe` existe (`Test-Path`).
+
+**Nota (ruta real — ver ledger):** los binarios quedan en `tools\XenonRecomp\build\XenonRecomp\XenonRecomp.exe` y `build\XenonAnalyse\XenonAnalyse.exe`.
 
 - [x] **Step 4: Commit (el checkout es de terceros, queda excluido por .gitignore del upstream si procede; registrar fine en `env-audit.md` que el parche aplicó en `ddd128b`)**
 
@@ -297,7 +301,7 @@ git add docs/superpowers/m0-platform-surface.md && git commit -m "docs(m0): info
 
 ### Hallazgos de la sesión de validación (resumen para las fases PS5)
 
-1. **El pipeline real del port es el backendhardware D3D11** (gpu_hw_d3d11.*): TTT2_GPU_HW no definido deja el intérprete de shaders en CPU (80% CPU, GPU idle, cinemáticas sin animar, ruido DXT2_3 en escenarios, DXT4_5/DXT1 funcionando). Con TTT2_GPU_HW=1: RTX 5070 activa, cinematica animada, combates fluidos, **ruido del escenario eliminado por completo** (runs 8-9). Cambio aplicado: RequestedMode() en gpu_hw_control.h devuelve Mode::On por defecto (=0 hace fallback al intérprete). Implicación M4: en PS5 el backend equivalente va sobre DXVK-native/RADV; no reutilizar el path CPU para el objetivo.
+1. **El pipeline real del port es el backend hardware D3D11** (gpu_hw_d3d11.*): TTT2_GPU_HW no definido dejaba el interprete de shaders en CPU (80% CPU, GPU idle, cinemáticas sin animar, ruido DXT2_3 en escenarios, DXT4_5/DXT1 funcionando). Con TTT2_GPU_HW=1: RTX 5070 activa, cinemática animada, combates fluidos, uploads por formato correctos (19t/20t/18t suben) y **el usuario jugó dos combates sin ruido ("el ruido ni rastro")**. Cambio aplicado: RequestedMode() en gpu_hw_control.h devuelve Mode::On por defecto (=0/false/off lo fuerza Off para diagnóstico). Implicaciones M4: en PS5 el backend equivalente va sobre DXVK-native/RADV. NOTA DE POLÍTICA (revisión 1a46b06): en Windows un fallo del backend hace fallback limpio al intérprete CPU (Guarded devuelve false); en hosts NO Windows Guarded hace std::exit(EXIT_FAILURE) a propósito - el fallo de RADV/DXVK-native en M4 terminará el proceso limpio con mensaje, NO degradará a software. Los planes M4 deben asumir esa política.
 2. **El instalador no corrompe datos**: data025/051 difieren del ISO porque son contenedores LZX expandidos en instalación (nrfo/ofsd); tamaños instalados = los expandidos de diseño. Falsa alarma arqueada con hashes + árbol XDVDFS.
 3. **Herramientas de diagnóstico añadidas** (gated por env, apagadas de serie): TTT2_MIRRORDUMP=<start>,<size> en phys_mirror.cpp (dump del contenido físico A de chunks cacheados), TTT2_TEXRAW, TEXDUMP/FRAMETIME previos. Logs de las corridas: run5-run9 en C:\ttt2\.
 4. **Build de rendimiento** = ppc-opt 2 (uild-o2); el o1 queda como build de referencia de Task 6. Binario validado final: port/build-o2/tekken_recomp.exe + instalación C:\ttt2\install-test\game\.

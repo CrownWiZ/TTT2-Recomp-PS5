@@ -429,7 +429,8 @@ target_include_directories(tekken_recomp PRIVATE
 target_compile_definitions(tekken_recomp PRIVATE TTT2_LOCAL_SAVES=$<BOOL:${TTT2_LOCAL_SAVES}>)
 target_compile_definitions(tekken_recomp PRIVATE TTT2_DRAW_CAPTURE_DIAGNOSTICS=1)
 target_compile_definitions(tekken_recomp PRIVATE TTT2_D3D11_MOVIE_BACKEND=1)
-# Hardware renderer (gpu_hw_d3d11.h); still opt-in at run time with TTT2_GPU_HW=1 / compare.
+# Hardware renderer (gpu_hw_d3d11.h); on by default at run time, TTT2_GPU_HW=0
+# forces the CPU shader interpreter, =compare keeps the A/B mode.
 target_compile_definitions(tekken_recomp PRIVATE TTT2_GPU_HW_BACKEND=1)
 target_compile_definitions(tekken_recomp PRIVATE TTT2_GPU_HW_D3D11=1)
 target_link_libraries(tekken_recomp PRIVATE SDL3::SDL3 d3d11 dxgi d3dcompiler)

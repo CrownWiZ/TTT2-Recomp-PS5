@@ -34,7 +34,8 @@ A failed or cancelled install deletes the files it wrote (file by file) and empt
 
 Installed mode (runtime `main.cpp InstalledLayout`): started with no arguments and
 `<exe dir>\game\tekken.img` present, the exe defaults `TTT2_VFS_ROOT=<exe dir>\game`,
-`TTT2_GPU_HW=1`, `TTT2_FBDUMP=0`, and with no stderr attached logs to
+`TTT2_GPU_HW=1` (the hardware pipeline is now the global default anyway),
+`TTT2_FBDUMP=0`, and with no stderr attached logs to
 `%LOCALAPPDATA%\TTT2Recomp\log.txt`. All game writes already go to `%LOCALAPPDATA%\TTT2Recomp`
 (saves, settings.ini, shader cache, net), so a read-only Program Files install works.
 
