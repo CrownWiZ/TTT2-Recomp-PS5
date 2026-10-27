@@ -19,7 +19,7 @@ Sesión de continuación (27-10-2026): la sesión previa ("Programa scene PS5") 
 - **Task 2 (SDK): COMPLETE.** apt: `unzip`, luego `llvm-18 lld-18` (imprescindible: los wrappers del SDK resuelven el host toolchain con `llvm-config-18..15`; sin él mueren con `/llvm-clang: No such file or directory`). Verificación: `prospero-clang --version` → `Ubuntu clang version 18.1.3` + `Target: x86_64-sie-ps5`.
 - **Task 3 (hello_world): COMPLETE.** `make -C /opt/ps5-payload-sdk/samples/hello_world` → `hello_world.elf` ELF64 PIE x86-64 dinámico, sin warnings (`-Wall -Werror`). `file`/`readelf` OK.
 - **Task 4 (smoke del repo): COMPLETE.** `tools/ps5/smoke/main.c` (notificación + `sceKernelDebugOutText`), `tools/ps5/Makefile` (include de prospero.mk, rutas SELF_DIR absolutas), `tools/ps5/send_smoke.sh` (prospero-deploy = socat). Build OK: `tools/ps5/build/ttt2_smoke.elf` ELF64 PIE x86-64. `.gitignore`: `!/tools/ps5/`.
-- **Task 5 (consola): PENDIENTE usuario** — IP de la PS5 + confirmación de cargador (Relapse 9021 directo vs elfldr vía 9020).
+- **Task 5 (consola): COMPLETE.** Descubrimiento de consola por escaneo (usuario dio IP 192.168.0.24; su stack: Relapse/kstuff autoloader + shadowmount + web file manager; elfldr.elf lanzado por el usuario). 9021 abierto. Envíos con socat: `hello_world.elf` → burbuja "Hello, world!" ✓; `ttt2_smoke.elf` → burbuja "TTT2 PS5 smoke: build/load OK" ✓; repetición del smoke → burbuja ✓ (ciclo repetible, 3/3). ftpsrv v0.21.1 residente (FTP :2121, banner por socket) para M4/M5.
 - **socat:** instalado (requisito de `prospero-deploy`).
 
 ## Notas de protocolo
