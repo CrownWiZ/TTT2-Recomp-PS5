@@ -33,6 +33,7 @@
 !/tools/run_dxvk11_linux.sh
 !/tools/*.cmd
 !/tools/patches/
+!/tools/ps5/
 !/tools/x_decompress/
 
 # The recompiler configuration only (addresses and jump tables, no game bytes).
