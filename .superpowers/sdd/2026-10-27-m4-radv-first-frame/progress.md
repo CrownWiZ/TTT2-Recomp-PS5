@@ -56,6 +56,18 @@ M3 cerrado antes de esto (f8f5656): ciclo validado en consola (3/3 burbujas, elf
 - **Task 5 (port host -ps5 + build): SIGUIENTE.**
 - Recordatorio de protocolo: aviso al usuario ANTES de cada lanzamiento/captura automática.
 
+## CHECKOLL Task 5 (28-10 noche) — estado honesto
+
+- **COMPLETOS Y SÓLIDOS:** `host_thread_ps5.cpp`, `audio_output_ps5.cpp`, `host_window_ps5.{h,cpp}`, `host_input_ps5.cpp`, `host_runtime_ps5.cpp`, `kernel/sce_ps5.h` — todos espejando los contratos de los Linux ya validados.
+- **A MEDIA TINTA (NO compila):** `host_vm_ps5.cpp` — la primera mitad está escrita (Armed/Dirty, pipe, spin-wake, single-step) pero con campos inventados del signal context (`__mc_saved_registers.??`): FALTA sondear la `ucontext_t`/`siginfo_t` de la libc del SDK (familia BSD vs Linux gregs) antes de cerrar el fichero. Faltan además: CancelNullPageStep, ReserveGuest (con el fork de memoria directa para el alias del espejo — NO memfd), ReleaseGuest, y las primitives restantes (QueryReadRegion con memcpy del rango informado, Protect, ResetWriteWatch, TakeWriteWatch, PrepareHostWrite, ProtectForRollback, LastError).
+- **PENDIENTES DE LA LISTA ANTERIOR:** host_fault_ps5, 2 gates (#error con TTT2_HOST_PS5), trampolines Vulkan, script de build+link.
+
+**Próximo paso concreto (otra sesión):**
+1. Sondear la libc: `prospero-nm target/lib/libkernel.so | grep -E 'sigaction|sigaltstack'` + los headers de signal/ucontext/sys/_types — el mapa de la superficie de señales.
+2. Terminar host_vm_ps5.cpp con eso (el swap syscall está diseñado: pipe libc + spin-yield, alias en memoria directa para el espejo).
+3. Resto de los forks + script de build + PRIMERA compilación del ELF del port sobre los estáticos del Task 4.
+4. Task 6 = subir por FTP (:2121, ftpsrv residente) y lanzar por 9021 (elfldr) → la primera imagen del port en la TV.
+
 ## Task 5 (en curso, 28-10 tarde) — host `-ps5` del port
 
 **Escrito (port/src/runtime/):**
