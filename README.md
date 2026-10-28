@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/status-M1%20in%20progress-e85c1c?style=flat-square" alt="status: M1 in progress">
+  <img src="https://img.shields.io/badge/status-M4%20in%20progress-e85c1c?style=flat-square" alt="status: M4 in progress">
   <img src="https://img.shields.io/badge/target-PS5%20fw%2013.60-0078D4?style=flat-square" alt="target ps5 13.60">
   <img src="https://img.shields.io/badge/entry-Relapse%20payload%20loader-4c9e4c?style=flat-square" alt="relapse">
   <img src="https://img.shields.io/badge/graphics-DXVK--native%20%2B%20RADV-8a4fbe?style=flat-square" alt="graphics">
@@ -47,18 +47,25 @@ No game assets are included or redistributed. You must own the game: the PC port
 | Milestone | Goal | Status |
 |---|---|---|
 | **M0** | Boot spike: build inventory + platform-surface report | ✅ done ([report](docs/superpowers/m0-platform-surface.md)) |
-| **M1** | Baseline: game builds and runs on Windows from the user's own copy | 🔄 in progress |
-| **M2** | Multiplatform build proof (WSL2, software rasterizer — portability only) | ⬜ not started |
-| **M3** | Prospero toolchain + minimal ELF boots on the console | ⬜ not started |
-| **M4** | DXVK-native + RADV on PS5: first frame on screen | ⬜ not started |
+| **M1** | Baseline: game builds and runs on Windows from the user's own copy | ✅ done — the game boots to menu and combat at 60 fps with the hardware D3D11 renderer as the default pipeline |
+| **M2** | Multiplatform build proof (WSL2, software rasterizer — portability only) | ✅ done — full Linux build live (DXVK-native + LAVAPIPE); findings F1–F4 closed |
+| **M3** | Prospero toolchain + minimal ELF boots on the console | ✅ done — validated on a real PS5: 3/3 payloads via the Relapse elfldr (port 9021), resident FTP server |
+| **M4** | DXVK-native + RADV on PS5: first frame on screen | 🔄 in progress — see notes below |
 | **M5** | Fully playable offline: saves, DualSense, audio, 60 fps | ⬜ not started |
 | **M6** | Online (optional): direct IP + community server; Steamworks removed | ⬜ not started |
 
-Design document: [`docs/superpowers/specs/2026-10-26-ttt2-ps5-port-design.md`](docs/superpowers/specs/2026-10-26-ttt2-ps5-port-design.md) · Implementation plan (M0+M1): [`docs/superpowers/plans/2026-10-26-m0-m1-windows-build.md`](docs/superpowers/plans/2026-10-26-m0-m1-windows-build.md)
+### M4 progress log (updated 2026-10-28)
+
+- **RADV-PS5 built and GO:** the Mesa RADV fork for the console (`radv-winsys=ps5`, static 272 MB archive) reports **Vulkan 1.4** and every DXVK-critical feature/extension verified (timeline semaphores, robustness2, transform feedback, BC1-7…). Evidence: [`m4-radv-ps5-vulkaninfo.txt`](.superpowers/m4-radv-ps5-vulkaninfo.txt).
+- **Boot splash working:** the port shows its own credits screen ("TEKKEN TAG TOURNAMENT 2 · RECOMPILADO") before the game's logo sequence, on both present paths, with a hand-made 8x8 font — caught and fixed a glyph-mirroring bug (LSB-first font, off-by-one index) while porting it.
+- **DXVK-native statically linked for the PS5 (new):** a `display` WSI backend (VK_KHR_display → sceVideoOut, no window manager) lands as a repo patch; cross-built with the console SDK into 8 static archives (`d3d11_static`, `dxgi_static`, core, dxbc…). `nm` verifies the D3D11/DXGI entry points the game links against.
+- **Next (Task 5–6):** link everything into the console ELF (port + DXVK + RADV + FFmpeg XMA trampolines) and put the first frame on the TV.
+
+Design document: [`docs/superpowers/specs/2026-10-26-ttt2-ps5-port-design.md`](docs/superpowers/specs/2026-10-26-ttt2-ps5-port-design.md) · Implementation plans: [M0+M1](docs/superpowers/plans/2026-10-26-m0-m1-windows-build.md) · [M3](docs/superpowers/plans/2026-10-27-m3-prospero-console-boot.md) · [M4](docs/superpowers/plans/2026-10-27-m4-radv-first-frame.md)
 
 ## Building today
 
-Today the fork builds exactly like upstream — see upstream's [`BUILDING.md`](BUILDING.md). The PS5 toolchain lands in M3/M4 and its build scripts will be documented here as they exist.
+Today the fork builds exactly like upstream — see upstream's [`BUILDING.md`](BUILDING.md). The PS5 toolchain is landing now: the M4 scripts (DXVK cross build + RADV for the console) live in [`tools/ps5/dxvk/`](tools/ps5/dxvk/), consumed from WSL against the pinned mihawk-99 payload SDK. Full PS5 build instructions will be documented here when M4 closes.
 
 ## License and legal
 
@@ -81,6 +88,6 @@ Today the fork builds exactly like upstream — see upstream's [`BUILDING.md`](B
 
 **Qué es:** fork del port nativo de Windows de Tekken Tag Tournament 2 (Xbox 360, recompilación estática) con un objetivo: que el juego funcione **nativamente como homebrew en una PS5 estándar con firmware 13.60** (exploit Relapse). El CPU de la PS5 es x86-64, así que el código recompilado no cambia: el trabajo está en las capas de plataforma (gráficos vía DXVK-native + RADV de Mesa, entrada con `scePad`, audio con `sceAudioOut`, contenido en `/data/homebrew`, arranque por el cargador de ELF de Relapse).
 
-**Estado:** M0 completado (informe de superficie); M1 en curso (build base en Windows desde la copia propia del juego). Ver tabla y documentos de diseño arriba.
+**Estado (2026-10-28):** M0–M3 cerrados — el juego corre en Windows a 60 fps (build base), compila también en Linux (DXVK-native), y el toolchain del Prospero ya corre en una PS5 real (payloads por elfldr 9021 + FTP residente). M4 en curso: RADV-PS5 construido con veredicto GO (Vulkan 1.4 y todas las extensiones que DXVK exige), splash de créditos funcionando, y DXVK-native ya cross-compilado como estáticos para la consola con un backend WSI `display` nuevo (VK_KHR_display → sceVideoOut). Queda el enlazado del ELF completo y el primer frame en la TV. Ver tabla y notas de progreso arriba.
 
 **Aviso:** proyecto no oficial, sin assets del juego incluidos: necesitas tu propia copia del juego de Xbox 360 para generar los datos. Úsalo solo en consolas que te pertenezcan.
