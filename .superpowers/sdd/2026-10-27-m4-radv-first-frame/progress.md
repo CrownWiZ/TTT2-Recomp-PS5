@@ -55,3 +55,23 @@ M3 cerrado antes de esto (f8f5656): ciclo validado en consola (3/3 burbujas, elf
 - **Task 4 (DXVK WSI): COMPLETE (28-10).** Cross-build verde con los 8 estáticos y entry points exportados (D3D11CreateDevice/AndSwapChain, CreateDXGIFactory/1/2; 2.108 símbolos T; miembros completos en disco — el formato lean del prospero-ar es apariencia; Task 5 enlaza en WSL desde el build dir; los copys de `.superpowers/m4-dxvk-ps5/` son referencia). Iteraciones: cross-compiler correcto = prospero-clang++ del PROPIO SDK (el prospero-clang18 externo no resuelve prospero-lld); el build dir de meson ata el source-path del primer configure → caché nuevo exige rm; la preparación de fuente vive ya en el lado WSL (fs nativo, sin /mnt/c en el camino de compilación).
 - **Task 5 (port host -ps5 + build): SIGUIENTE.**
 - Recordatorio de protocolo: aviso al usuario ANTES de cada lanzamiento/captura automática.
+
+## Task 5 (en curso, 28-10 tarde) — host `-ps5` del port
+
+**Escrito (port/src/runtime/):**
+- `host_thread_ps5.cpp` — pthreads sin SDL, semánticas 1:1 del impl SDL (gate de arranque, cancel-on-Close, detach, Pause=_mm_pause, id=hash de pthread_t; PinToGuestCpu=false como el portable).
+- `audio_output_ps5.cpp` — API idéntica de audio_output.h sobre sceAudioOut bloqueante (stereo S16 downmix, crédito +1 por submit completado = regla de OnStreamDataComplete; reloj silencioso si falla el device). Define ConvertAudioPcm (el SDL audio_output.cpp queda EXCLUIDO del build PS5).
+- `host_window_ps5.{h,cpp}` — shell de video: una TV (VideoOut MAIN), 2 buffers BGRX exclusivos en memoria directa (allocate+map, 1 MiB) para splash/fallback + token 1 como HWND de la WSI `display` (kDisplayWindowToken en la cabecera del port).
+- `host_input_ps5.cpp` — scePad → Snapshot bloqueado; botones → valores Xbox del ABI (cross=A, circle=B, square=X, triangle=Y).
+- `host_runtime_ps5.cpp` — layout fijo /data/homebrew/ttt2 (game_files_x + saves/config/cache/logs), sin /proc ni fork/exec; guard de página 0 desactivado por plataforma; Ps5Notify (toast, ciclo M3).
+- `kernel/sce_ps5.h` — declaraciones a mano (convención escena, como el spike M3): Notification, AudioOut, VideoOut (RegisterBuffers2/SubmitFlip2), Pad, memoria directa.
+- `host_window_sdl.h` ajustada: ya no incluye SDL (fwd-decl `struct SDL_Window;`) — el contrato compila sin gestor de ventanas.
+
+**Pendiente del Task 5:**
+1. `host_file_ps5` (fork de host_file_linux; O_PATH→O_RDONLY|O_DIRECTORY; leer host_file.h + host_file_common primero).
+2. `host_vm_ps5` — el fork serio: write-watch de Linux = /proc soft-dirty → en PS5 por mprotect+SIGSEGV (path de rollback). Leer host_vm_linux.cpp COMPLETO antes.
+3. `phys_mirror` posix (revisar si phys_mirror_linux.cpp ata a __linux__).
+4. `host_fault_ps5` (copia del linux sin CancelNullPageStep).
+5. Relax de gates (#error) en host_random_linux / host_storage_linux con TTT2_HOST_PS5.
+6. Trampolines Vulkan (vkGetInstanceProcAddr→vk_icdGetInstanceProcAddr + vkGetDeviceProcAddr vía GIPA; patrón entrypoints.c).
+7. `tools/ps5/build_port_ps5.sh` — lista explicit del target Linux (CMakeLists 269-282 + kernel glob excl. windows-y + gpu_render/native_d3dcompiler + PPC con splitter) + radv-link recipe + elfldr 9021.

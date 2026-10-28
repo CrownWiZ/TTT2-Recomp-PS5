@@ -1,6 +1,8 @@
 #pragma once
 
-#include <SDL3/SDL_video.h>
+// SDL types stay opaque so window-less platforms compile this contract:
+// only host_window_sdl.cpp includes the real SDL headers.
+struct SDL_Window;
 #include <cstdint>
 
 namespace host_window {
