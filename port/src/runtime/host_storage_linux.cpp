@@ -1,7 +1,7 @@
 #include "host_storage.h"
 
-#if !defined(__linux__)
-#error "This save storage backend requires Linux"
+#if (!defined(__linux__) && !defined(TTT2_HOST_PS5))
+#error "This save storage backend requires Linux or the PS5 build"
 #endif
 
 #include <cerrno>
@@ -13,6 +13,15 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <vector>
+
+#if defined(TTT2_HOST_PS5)
+// The Linux O_PATH descriptor (no data traffic, metadata only) does not
+// exist on this libc; a readable directory descriptor fills the same role —
+// these handles are only ever converted to readable descriptors or stats.
+#ifndef O_PATH
+#define O_PATH O_RDONLY
+#endif
+#endif
 
 namespace host_storage {
 uint32_t Error(const std::error_code& error)

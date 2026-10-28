@@ -1,14 +1,26 @@
-// PS5 guest VM (interface: host_vm.h) — same memory model as the Linux build
-// with the syscall surface substituted. Write-watch is mprotect+SIGSEGV
-// bookkeeping exactly as on Linux; the only shadows are in how the host
-// primitives express those moves:
-// - the fault pipe uses pipe/read/write libc calls (async-signal-safe here),
-//   and the worker wake/wait spins the completion flag with sched_yield,
-//   because Prospero exposes no futex syscall through its libc;
-// - the physical mirror maps one physical allocation twice (guest alias and
-//   worker stage), the standard console-memory pattern, instead of a memfd.
-// The null-page helper set stays available: InstallGuestGuards simply does
-// not call it on this platform.
+// PS5 guest VM (interface: host_vm.h) — the Linux memory model with the
+// syscall surface substituted for Prospero.
+//
+// Write-watch is mprotect+SIGSEGV bookkeeping exactly as on Linux (both
+// kernels report page-protection SEGVs the same way; si_code SEGV_ACCERR = 2
+// and the page-fault error code bit 1 = write on both). Differences live in
+// the host primitives only:
+// - the fault pipe uses pipe() and the read/write libc calls, all
+//   async-signal-safe here and inside the handler; the completion handshake
+//   spins the done flag with sched_yield because no futex syscall exists
+//   through the libc;
+// - ReadMemory was Linux's process_vm_readv, only present to read safely
+//   across a protected range; here QueryReadRegion gates a plain memcpy, same
+//   contract (false for protected/unmapped ranges);
+// - the physical-mirror staging mapping was a memfd aliased twice. The console
+//   equivalent would be a double map of one physical allocation; the simplest
+//   correct publish instead reopens each cached-view page (RW, copy, armed
+//   read) while the mirror lock excludes racing guest threads. The pages keep
+//   arbitrary contents between publish calls, which is what the cache
+//   guarantees anyway.
+// The null-page helpers exist for interface parity: the PS5 runtime never
+// calls EnableNullPageGuard (no single-step traps from a closed kernel), so
+// the trap path stays dormant.
 #include "host_vm.h"
 #include "guest_memory.h"
 #if defined(TTT2_GEOMETRY_AB_PROBE)
@@ -31,12 +43,15 @@
 #include <new>
 #include <pthread.h>
 #include <sched.h>
+#include <signal.h>
 #include <sys/mman.h>
 #include <sys/uio.h>
 #include <ucontext.h>
 #include <unistd.h>
 
-#include "kernel/sce_ps5.h"
+#ifndef MAP_ANONYMOUS
+#define MAP_ANONYMOUS MAP_ANON
+#endif
 
 namespace host_vm {
 namespace {
@@ -49,10 +64,8 @@ size_t g_bytes = 0;
 std::unique_ptr<uint8_t[]> g_state;
 std::unique_ptr<uint8_t[]> g_permission;
 std::unique_ptr<std::atomic<uint8_t>[]> g_rollbackPages;
-uint8_t* g_mirrorStage = nullptr;
 uintptr_t g_mirrorStart = 0;
 size_t g_mirrorBytes = 0;
-int64_t g_mirrorDevice = -1;
 std::atomic_flag g_lock = ATOMIC_FLAG_INIT;
 struct sigaction g_previous{};
 struct sigaction g_previousTrap{};
@@ -68,10 +81,10 @@ RollbackWriteHandler g_rollbackWrite = nullptr;
 std::atomic<bool> g_rollbackRegistered{false};
 int g_faultPipe[2] = {-1, -1};
 // A guest can return from main while this worker is still waiting for faults.
-// ReleaseGuest joins it explicitly before tearing anything down.
+// pthread_t has no joinable-thread destructor; ReleaseGuest joins explicitly.
 pthread_t g_faultWorker{};
 bool g_faultWorkerStarted = false;
-// Run-stable worker identity for the recursion guard.
+// Run-stable worker identity for the handler recursion check.
 unsigned long g_workerKey = 0;
 
 struct FaultRequest
@@ -149,6 +162,7 @@ void* FaultWorker(void*)
     return nullptr;
 }
 
+// DeferFault runs inside the SIGSEGV handler: only async-signal-safe calls.
 bool DeferFault(uintptr_t address, bool rollback = false)
 {
     // The worker must not wait for itself. A recursive fault means that the
@@ -173,8 +187,8 @@ void Chain(int number, siginfo_t* info, void* context)
     const auto& previous = number == SIGTRAP ? g_previousTrap : g_previous;
     (void)info; (void)context;
     if (previous.sa_handler == SIG_IGN) return;
-    // No restartable default disposition here: a chained fault at this point
-    // means real corruption, and the ELF exits the way the M3 cycle does.
+    // The RestBSD default-disposition restart trick needs tgkill; a chained
+    // fault here means real corruption anyway. Exit the way the M3 cycle does.
     _exit(128 + number);
 }
 
@@ -183,12 +197,12 @@ void FinishNullPageStep(void* context)
     if (!t_nullStep) return;
     t_nullStep = false;
     if (context)
-        static_cast<ucontext_t*>(context)->uc_mcontext.__mc_saved_registers.? = 0;
+        static_cast<ucontext_t*>(context)->uc_mcontext.mc_rflags &= ~0x100;
     // One instruction may write more than 32 bytes or cross a page. Clear
     // the entire null guard before restoring its read-only protection.
     auto* bytes = reinterpret_cast<volatile uint8_t*>(g_base);
-    for (size_t i = 0; i < guest_memory::ZeroTailBytes; ++i) bytes[i] = 0;
-    if (mprotect(g_base, guest_memory::ZeroTailBytes, PROT_READ) != 0)
+    for (size_t i = 0; i < guest_memory::NullGuardBytes; ++i) bytes[i] = 0;
+    if (mprotect(g_base, guest_memory::NullGuardBytes, PROT_READ) != 0)
         _exit(128 + SIGSEGV);
 }
 
@@ -206,26 +220,26 @@ void Fault(int number, siginfo_t* info, void* context)
     if (number == SIGSEGV && info && info->si_code == SEGV_ACCERR && context && g_base)
     {
         auto* cpu = static_cast<ucontext_t*>(context);
-        const bool write = (cpu->uc_mcontext.__mc_saved_registers_.? & 2) != 0;
+        // mc_err shares the x86 page-fault error encoding: bit 1 = write.
+        const bool write = (cpu->uc_mcontext.mc_err & 2) != 0;
         const uintptr_t base = reinterpret_cast<uintptr_t>(g_base);
-        const uint32_t address = reinterpret_cast<uint32_t>(info->si_addr);
+        const uintptr_t address = reinterpret_cast<uintptr_t>(info->si_addr);
         if (write && g_nullGuard.load(std::memory_order_acquire) &&
-            address >= 0 && address < guest_memory::ZeroTailSize)
+            address >= base && address - base < guest_memory::NullGuardBytes)
         {
-            if (mprotect(g_base, guest_memory::ZeroTailSize,
-                        PROT_READ | PROT_WRITE) == 0)
+            if (mprotect(g_base, guest_memory::NullGuardBytes,
+                         PROT_READ | PROT_WRITE) == 0)
             {
                 t_nullStep = true;
-                // Single-step: set the trap flag in the interrupted context.
-                cpu->uc_mcontext.__mc_saved_registers_.? |= 0x100;
+                cpu->uc_mcontext.mc_rflags |= 0x100;
                 return;
             }
         }
-        if (address >= 0 && address < g_bytes)
+        if (write && address >= base && address - base < g_bytes)
         {
-            const size_t page = address / PageSize;
+            const size_t page = (address - base) / PageSize;
             if (g_rollbackPages[page].load(std::memory_order_acquire) &&
-                g_rollbackRegistered.load(std::memory_order_acquire) && DeferFault(g_base + address, true)) return;
+                g_rollbackRegistered.load(std::memory_order_acquire) && DeferFault(address, true)) return;
             while (g_lock.test_and_set(std::memory_order_acquire)) {}
             // A second thread may have opened the page while this thread entered
             // the handler. Retrying its instruction is then sufficient.
@@ -236,7 +250,7 @@ void Fault(int number, siginfo_t* info, void* context)
             }
             if (g_permission[page] == Write && g_state[page] == Armed &&
                 mprotect(g_base + page * PageSize, PageSize,
-                        PROT_READ | PROT_WRITE) == 0)
+                         PROT_READ | PROT_WRITE) == 0)
             {
                 g_state[page] = Dirty;
                 g_lock.clear(std::memory_order_release);
@@ -244,8 +258,8 @@ void Fault(int number, siginfo_t* info, void* context)
             }
             g_lock.clear(std::memory_order_release);
         }
-        if (base + address >= g_deferredFirst && base + address < g_deferredLast &&
-            g_deferredHandler && DeferFault(g_base + address))
+        if (address >= g_deferredFirst && address < g_deferredLast &&
+            g_deferredHandler && DeferFault(address))
             return;
     }
     if (auto handler = g_unhandledHandler.load(std::memory_order_acquire))
@@ -253,3 +267,389 @@ void Fault(int number, siginfo_t* info, void* context)
     Chain(number, info, context);
 }
 } // namespace
+
+void CancelNullPageStep(void* context) { FinishNullPageStep(context); }
+
+uint8_t* ReserveGuest(size_t bytes)
+{
+    if (g_base || bytes == 0 || bytes % PageSize || size_t(sysconf(_SC_PAGESIZE)) != PageSize)
+    {
+        errno = EINVAL;
+        return nullptr;
+    }
+    void* memory = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (memory == MAP_FAILED) return nullptr;
+    // The reserved range must be writable at once (the MIPS-era caller opens
+    // every page explicitly); a 4 GiB rwx-range assignment is the whole-range
+    // write that commits them in one kernel pass.
+    if (mprotect(memory, bytes, PROT_READ | PROT_WRITE) != 0)
+    {
+        const int failure = errno;
+        munmap(memory, bytes);
+        errno = failure;
+        return nullptr;
+    }
+    const size_t pages = bytes / PageSize;
+    auto state = std::unique_ptr<uint8_t[]>(new (std::nothrow) uint8_t[pages]);
+    auto permission = std::unique_ptr<uint8_t[]>(new (std::nothrow) uint8_t[pages]);
+    auto rollbackPages = std::unique_ptr<std::atomic<uint8_t>[]>(new (std::nothrow) std::atomic<uint8_t>[pages]);
+    if (!state || !permission || !rollbackPages) { munmap(memory, bytes); errno = ENOMEM; return nullptr; }
+    for (size_t page = 0; page < pages; ++page)
+    {
+        state[page] = Armed;
+        permission[page] = Write;
+        rollbackPages[page].store(0, std::memory_order_relaxed);
+    }
+    g_base = static_cast<uint8_t*>(memory);
+    g_bytes = bytes;
+    g_state = std::move(state);
+    g_permission = std::move(permission);
+    g_rollbackPages = std::move(rollbackPages);
+    struct sigaction action{};
+    sigemptyset(&action.sa_mask);
+    action.sa_sigaction = Fault;
+    action.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    if (sigaction(SIGSEGV, &action, &g_previous) != 0)
+    {
+        const int failure = errno;
+        ReleaseGuest(g_base, bytes);
+        errno = failure;
+        return nullptr;
+    }
+    g_handlerInstalled = true;
+    if (sigaction(SIGTRAP, &action, &g_previousTrap) != 0)
+    {
+        const int failure = errno;
+        ReleaseGuest(g_base, bytes);
+        errno = failure;
+        return nullptr;
+    }
+    g_trapHandlerInstalled = true;
+    if (mprotect(g_base, bytes, PROT_READ) != 0)
+    {
+        const int failure = errno;
+        ReleaseGuest(g_base, bytes);
+        errno = failure;
+        return nullptr;
+    }
+    return g_base;
+}
+
+void ReleaseGuest(uint8_t* base, size_t bytes)
+{
+    if (base != g_base || bytes != g_bytes || !base) return;
+    if (g_faultWorkerStarted)
+    {
+        close(g_faultPipe[1]);
+        g_faultPipe[1] = -1;
+        pthread_join(g_faultWorker, nullptr);
+        g_faultWorkerStarted = false;
+        close(g_faultPipe[0]);
+        g_faultPipe[0] = -1;
+    }
+    g_deferredFirst = g_deferredLast = 0;
+    g_deferredHandler = nullptr;
+    g_rollbackRegistered.store(false, std::memory_order_release);
+    g_captureRollback = nullptr;
+    g_rollbackWrite = nullptr;
+    if (g_handlerInstalled) sigaction(SIGSEGV, &g_previous, nullptr);
+    if (g_trapHandlerInstalled) sigaction(SIGTRAP, &g_previousTrap, nullptr);
+    g_handlerInstalled = false;
+    g_trapHandlerInstalled = false;
+    g_nullGuard.store(false, std::memory_order_release);
+    g_mirrorStart = 0;
+    g_mirrorBytes = 0;
+    munmap(base, bytes);
+    g_state.reset();
+    g_permission.reset();
+    g_rollbackPages.reset();
+    g_base = nullptr;
+    g_bytes = 0;
+}
+
+bool Protect(void* address, size_t bytes, Protection protection)
+{
+    size_t first = 0, last = 0;
+    if (!Range(address, bytes, first, last)) return false;
+    const uint8_t permission = protection == Protection::None ? NoAccess :
+        protection == Protection::ReadOnly ? Read : Write;
+    Lock lock;
+    const int native = permission == NoAccess ? PROT_NONE :
+        permission == Read ? PROT_READ : PROT_READ | PROT_WRITE;
+    if (!ProtectRun(first, last, native)) return false;
+    for (size_t page = first; page < last; ++page)
+    {
+        g_permission[page] = permission;
+        // Explicitly opening a page RW bypasses the watch fault. Mark it dirty
+        // conservatively until the caller rearms that range with ResetWriteWatch.
+        if (permission == Write) g_state[page] = Dirty;
+    }
+    return true;
+}
+
+bool EnableNullPageGuard()
+{
+    if (!g_base || g_bytes < guest_memory::NullGuardBytes ||
+        !Protect(g_base, guest_memory::NullGuardBytes, Protection::ReadOnly)) return false;
+    g_nullGuard.store(true, std::memory_order_release);
+    return true;
+}
+
+bool QueryReadRegion(const void* address, size_t maxBytes,
+                     size_t& regionBytes, bool& readable)
+{
+    if (!g_base || !maxBytes) { errno = EINVAL; return false; }
+    const uintptr_t base = reinterpret_cast<uintptr_t>(g_base);
+    const uintptr_t start = reinterpret_cast<uintptr_t>(address);
+    if (start < base || start - base >= g_bytes) { errno = EINVAL; return false; }
+    const size_t offset = start - base;
+    const size_t available = (std::min)(maxBytes, g_bytes - offset);
+    const size_t first = offset / PageSize;
+    const size_t last = (offset + available - 1) / PageSize + 1;
+    Lock lock;
+    readable = g_permission[first] != NoAccess;
+    size_t end = first + 1;
+    while (end < last && (g_permission[end] != NoAccess) == readable) ++end;
+    const uintptr_t limit = base + end * PageSize;
+    regionBytes = (std::min)(available, static_cast<size_t>(limit - start));
+    return true;
+}
+
+bool ReadMemory(const void* address, void* output, size_t bytes)
+{
+    // Linux used process_vm_readv to read across protected pages safely. The
+    // contract here is the same: read only what is one contiguous readable
+    // region; anything else reports false instead of faulting.
+    if (!bytes) return true;
+    size_t available = 0;
+    bool readable = false;
+    if (!QueryReadRegion(address, bytes, available, readable)) return false;
+    if (!readable || available < bytes) return false;
+    std::memcpy(output, address, bytes);
+    return true;
+}
+
+bool CanWrite(const void* address, size_t bytes)
+{
+    if (!bytes) return true;
+    size_t first = 0, last = 0;
+    if (!Range(const_cast<void*>(address), bytes, first, last)) return false;
+    Lock lock;
+    for (size_t page = first; page < last; ++page)
+        if (g_permission[page] != Write) return false;
+    return true;
+}
+
+bool PrepareHostWrite(void* address, size_t bytes)
+{
+    if (!bytes) return true;
+    size_t first = 0, last = 0;
+    if (!Range(address, bytes, first, last)) return false;
+    if (g_rollbackRegistered.load(std::memory_order_acquire))
+        for (size_t page = first; page < last; ++page)
+        {
+            if (!g_rollbackPages[page].load(std::memory_order_acquire)) continue;
+            const uintptr_t a = uintptr_t(g_base + page * PageSize);
+            g_rollbackWrite(a, g_captureRollback(a));
+        }
+    Lock lock;
+    for (size_t page = first; page < last; ++page)
+        if (g_permission[page] != Write) { errno = EACCES; return false; }
+    if (!ProtectRun(first, last, PROT_READ | PROT_WRITE)) return false;
+    for (size_t page = first; page < last; ++page) g_state[page] = Dirty;
+    return true;
+}
+
+bool ResetWriteWatch(void* address, size_t bytes)
+{
+    size_t first = 0, last = 0;
+    if (!Range(address, bytes, first, last)) return false;
+    Lock lock;
+    return ResetLocked(first, last);
+}
+
+bool TakeWriteWatch(void* address, size_t bytes, void** pages,
+                    size_t capacity, size_t& count, bool reset)
+{
+    size_t first = 0, last = 0;
+    if (!Range(address, bytes, first, last) || (!pages && capacity)) return false;
+    Lock lock;
+    // Most texture queries are clean. Let libc search the byte-state array in
+    // bulk instead of reducing every page to a size_t count on that path.
+#if defined(TTT2_GEOMETRY_AB_PROBE)
+    if (!(ttt2_hw::geometry_probe::ReferenceMask() & (512 | 2048)))
+#endif
+    if (!std::memchr(g_state.get() + first, Dirty, last - first))
+    {
+        count = 0;
+        return true;
+    }
+    size_t written = 0;
+    for (size_t page = first; page < last; ++page)
+        if (g_state[page] == Dirty) ++written;
+    if (written > capacity) { errno = ENOBUFS; return false; }
+    count = written;
+    for (size_t page = first, out = 0; page < last && out < written; ++page)
+        if (g_state[page] == Dirty)
+            pages[out++] = g_base + page * PageSize;
+    // A clean page with guest write permission is already host-read-only.
+    // The lock also excludes the fault handler, so a clean range needs no
+    // protection reset before releasing it to subsequent guest writes.
+    bool needsReset = written != 0;
+#if defined(TTT2_GEOMETRY_AB_PROBE)
+    needsReset |= (ttt2_hw::geometry_probe::ReferenceMask() & 512) != 0;
+#endif
+    if (reset && needsReset && !ResetLocked(first, last)) return false;
+    return true;
+}
+
+bool InstallMirrorBacking(void* address, size_t bytes)
+{
+    size_t first = 0, last = 0;
+    if (g_mirrorBytes || !Range(address, bytes, first, last) ||
+        reinterpret_cast<uintptr_t>(address) % PageSize || bytes % PageSize)
+    {
+        errno = EINVAL;
+        return false;
+    }
+    {
+        Lock lock;
+        for (size_t page = first; page < last; ++page)
+        {
+            g_permission[page] = NoAccess;
+            g_state[page] = Armed;
+        }
+    }
+    // The Linux build aliased a memfd twice to keep the copy off the guest
+    // view. Here FillMirrorView publishes page-by-page (copy between a
+    // writable window and the armed read-only state) under the same lock, so
+    // no aliasing of the reservation is required.
+    g_mirrorStart = reinterpret_cast<uintptr_t>(address);
+    g_mirrorBytes = bytes;
+    return true;
+}
+
+bool FillMirrorView(void* address, const void* source, size_t bytes)
+{
+    const uintptr_t start = reinterpret_cast<uintptr_t>(address);
+    if (start < g_mirrorStart || bytes == 0 ||
+        (start - g_mirrorStart) % PageSize || bytes % PageSize ||
+        start - g_mirrorStart >= g_mirrorBytes ||
+        bytes > g_mirrorBytes - (start - g_mirrorStart))
+    {
+        errno = EINVAL;
+        return false;
+    }
+    const size_t offset = start - g_mirrorStart;
+    const size_t first = (start - reinterpret_cast<uintptr_t>(g_base)) / PageSize;
+    const size_t last = first + bytes / PageSize;
+    Lock lock;
+    for (size_t page = first; page < last; ++page)
+        if (g_permission[page] != NoAccess) { errno = EBUSY; return false; }
+    auto* destination = reinterpret_cast<uint8_t*>(g_base) + offset;
+    // Publish fully populated pages together as readable and write-watch
+    // armed. The lock keeps racing guest threads out of the window; each page
+    // exits the window the moment its copy completes.
+    for (size_t page = first, done = 0; page < last; ++page, done += PageSize)
+    {
+        if (mprotect(g_base + page * PageSize, PageSize, PROT_READ | PROT_WRITE) != 0)
+            return false;
+        std::memcpy(destination + done, static_cast<const uint8_t*>(source) + done, PageSize);
+        if (mprotect(g_base + page * PageSize, PageSize, PROT_READ) != 0)
+            return false;
+        g_permission[page] = Write;
+        g_state[page] = Armed;
+    }
+    return true;
+}
+
+unsigned long LastError() { return static_cast<unsigned long>(errno); }
+
+bool RegisterUnhandledFaultHandler(UnhandledFaultHandler handler)
+{
+    UnhandledFaultHandler expected = nullptr;
+    if (!handler || !g_unhandledHandler.compare_exchange_strong(
+            expected, handler, std::memory_order_release,
+            std::memory_order_relaxed))
+    {
+        errno = EINVAL;
+        return false;
+    }
+    return true;
+}
+
+namespace {
+bool EnsureFaultWorker()
+{
+    if (g_faultWorkerStarted) return true;
+    if (pipe(g_faultPipe) != 0) return false;
+    // FD_CLOEXEC is irrelevant in a closed runtime, but keep descriptors sane.
+    fcntl(g_faultPipe[0], F_SETFD, FD_CLOEXEC);
+    fcntl(g_faultPipe[1], F_SETFD, FD_CLOEXEC);
+    const int startError = pthread_create(&g_faultWorker, nullptr, FaultWorker, nullptr);
+    if (startError)
+    {
+        close(g_faultPipe[0]);
+        close(g_faultPipe[1]);
+        g_faultPipe[0] = g_faultPipe[1] = -1;
+        errno = startError;
+        return false;
+    }
+    g_faultWorkerStarted = true;
+    return true;
+}
+}
+
+bool ProtectForRollback(void* address, size_t bytes, bool readOnly)
+{
+    size_t first = 0, last = 0;
+    if (!Range(address, bytes, first, last)) return false;
+    Lock lock;
+    // Tracked image ranges include immutable code, and heaps can contain
+    // inaccessible pages. Rollback must preserve those logical permissions.
+    for (size_t page = first; page < last;)
+    {
+        if (g_permission[page] != Write) { ++page; continue; }
+        const size_t begin = page;
+        while (page < last && g_permission[page] == Write) ++page;
+        // Publish the mask before removing write access: a simultaneous writer
+        // must never bypass the observer through the write-watch fallback.
+        if (readOnly)
+            for (size_t i = begin; i < page; ++i) g_rollbackPages[i].store(1, std::memory_order_release);
+        if (!ProtectRun(begin, page, readOnly ? PROT_READ : PROT_READ | PROT_WRITE)) return false;
+        if (!readOnly)
+            for (size_t i = begin; i < page; ++i) g_rollbackPages[i].store(0, std::memory_order_release);
+        if (!readOnly)
+            for (size_t i = begin; i < page; ++i) g_state[i] = Dirty;
+    }
+    return true;
+}
+
+bool RegisterRollbackWriteHandler(CaptureRollbackWriter capture, RollbackWriteHandler handler)
+{
+    if (!capture || !handler || g_rollbackWrite) { errno = EINVAL; return false; }
+    if (!EnsureFaultWorker()) return false;
+    g_captureRollback = capture;
+    g_rollbackWrite = handler;
+    g_rollbackRegistered.store(true, std::memory_order_release);
+    return true;
+}
+
+bool RegisterDeferredFaultHandler(void* address, size_t bytes,
+                                  DeferredFaultHandler handler)
+{
+    size_t first = 0, last = 0;
+    if (!handler || !Range(address, bytes, first, last) || g_deferredHandler)
+    {
+        errno = EINVAL;
+        return false;
+    }
+    if (!EnsureFaultWorker()) return false;
+    g_deferredFirst = reinterpret_cast<uintptr_t>(g_base) + first * PageSize;
+    g_deferredLast = reinterpret_cast<uintptr_t>(g_base) + last * PageSize;
+    g_deferredHandler = handler;
+    return true;
+}
+
+} // namespace host_vm

@@ -1,20 +1,36 @@
 #include "host_file.h"
 
-#if !defined(__linux__)
-#error "This file backend requires Linux"
+#if (!defined(__linux__) && !defined(TTT2_HOST_PS5))
+#error "This file backend requires Linux or the PS5 build"
 #endif
 
 #include <cerrno>
 #include <algorithm>
 #include <dirent.h>
 #include <fcntl.h>
-#include <linux/fs.h>
 #include <mutex>
 #include <string>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #include <vector>
+
+#if defined(TTT2_HOST_PS5)
+// The Linux O_PATH descriptor (no data traffic, metadata only) does not
+// exist on this libc; a readable descriptor fills the same role: every
+// O_PATH handle here is used for stats or rebased to a readable descriptor.
+#ifndef O_PATH
+#define O_PATH O_RDONLY
+#endif
+// No RENAME_NOREPLACE atom on the closed kernel: renames accept the lookup/
+// rename race (the sharing lock and delete marks already serialize guests).
+#include <stdio.h>
+#define TTT2_RENAME_FLAGS_UNSUPPORTABLE 1
+#endif
+
+#if defined(__linux__)
+#include <linux/fs.h>
+#endif
 
 namespace host_file {
 struct File {
@@ -583,10 +599,19 @@ uint32_t Rename(File* file, const std::filesystem::path& target, bool replace)
                 return SharingViolation;
     }
     else if (targetExists) name = requested; // removed between lookup and stat
+#if defined(TTT2_HOST_PS5)
+    // Plain rename: the replace flag's NOREPLACE atom does not exist. The
+    // case-only rename path above keeps the same file safe; a replaced
+    // target between the lookup and this point is a save-store race no
+    // other guest can trigger (the sharing lock holds).
+    if (renameat(file->parent, file->name.c_str(), file->parent, name.c_str()) < 0)
+        return Status(errno);
+#else
     const unsigned flags = replace ? 0 : RENAME_NOREPLACE;
     if (syscall(SYS_renameat2, file->parent, file->name.c_str(),
                 file->parent, name.c_str(), flags) < 0)
         return Status(errno);
+#endif
     const std::string oldName = file->name;
     for (File* other : g_openFiles)
     {

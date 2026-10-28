@@ -1,8 +1,8 @@
 #include "host_fault.h"
 #include "host_vm.h"
 
-#if !defined(__linux__) || !defined(__x86_64__)
-#error "The Linux guest fault backend currently requires x86-64 Linux"
+#if (!defined(__linux__) && !defined(TTT2_HOST_PS5)) || !defined(__x86_64__)
+#error "The posix guest fault backend currently requires x86-64 Linux or the PS5 build"
 #endif
 
 #include <cerrno>
@@ -19,6 +19,16 @@
 
 namespace host_fault {
 namespace {
+#if defined(TTT2_HOST_PS5)
+// FreeBSD amd64 mcontext layout (sdk/include/x86/ucontext.h): straight
+// fields instead of the Linux gregs array.
+inline uintptr_t FaultRip(const ucontext_t* context) { return uintptr_t(context->uc_mcontext.mc_rip); }
+inline int FaultErr(const ucontext_t* context) { return int(context->uc_mcontext.mc_err); }
+#else
+inline uintptr_t FaultRip(const ucontext_t* context) { return uintptr_t(context->uc_mcontext.gregs[REG_RIP]); }
+inline int FaultErr(const ucontext_t* context) { return int(context->uc_mcontext.gregs[REG_ERR]); }
+#endif
+
 struct Frame
 {
     sigjmp_buf jump;
@@ -76,9 +86,9 @@ void Unhandled(int number, void* rawInfo, void* rawContext)
     auto* context = static_cast<ucontext_t*>(rawContext);
     t_fault.signal = number;
     t_fault.address = info ? reinterpret_cast<uintptr_t>(info->si_addr) : 0;
-    t_fault.pc = context ? uintptr_t(context->uc_mcontext.gregs[REG_RIP]) : 0;
+    t_fault.pc = context ? FaultRip(context) : 0;
     t_fault.write = (number == SIGSEGV || number == SIGBUS) && context &&
-                    (context->uc_mcontext.gregs[REG_ERR] & 2) != 0;
+                    (FaultErr(context) & 2) != 0;
     siglongjmp(frame->jump, 1);
 }
 
@@ -103,8 +113,14 @@ void OtherFault(int number, siginfo_t* info, void* context)
         defaultAction.sa_handler = SIG_DFL;
         if (sigaction(number, &defaultAction, nullptr) != 0)
             _exit(128 + number);
+#if defined(TTT2_HOST_PS5)
+        // No tgkill on the closed kernel: the default disposition applies when
+        // a real (not in-process) re-raise arrives, which here means exit.
+        _exit(128 + number);
+#else
         if (syscall(SYS_tgkill, getpid(), syscall(SYS_gettid), number) < 0)
             _exit(128 + number);
+#endif
         return; // The default disposition runs when this handler returns.
     }
 }

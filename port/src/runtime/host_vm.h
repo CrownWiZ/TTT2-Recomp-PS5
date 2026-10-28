@@ -49,7 +49,7 @@ bool RegisterRollbackWriteHandler(CaptureRollbackWriter capture, RollbackWriteHa
 bool ProtectForRollback(void* address, size_t bytes, bool readOnly);
 unsigned long LastError();
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(TTT2_HOST_PS5)
 // Keep the first 64 KiB zero-backed and read-only. A guest write executes once
 // under single-step, then the whole guarded range is cleared before protection returns.
 bool EnableNullPageGuard();
