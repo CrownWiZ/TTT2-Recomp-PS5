@@ -9,12 +9,15 @@
  * Enumerates: instance/device extensions, core 1.1-1.3 features, the EXT
  * feature bits DXVK 1.9.2b depends on, queues, memory heaps/types, format
  * support for the D3D11-critical formats, and the VK_KHR_display devices the
- * VideoOut swapchain exposes. Report goes to /data/ttt2-vkinfo.txt (FTP) and
- * one notification bubble announces completion.
+ * VideoOut swapchain exposes. The report goes to /data/ttt2-vkinfo.txt and is
+ * ALSO streamed over TCP back to the PC (192.168.0.21:9999) — no FTP needed.
+ * One notification bubble announces completion.
  */
 
 #include <stdio.h>
 #include <string.h>
+#include <sys/types.h>
+#include <stdint.h>
 #include <vulkan/vulkan.h>
 
 typedef struct notify_request {
@@ -22,6 +25,82 @@ typedef struct notify_request {
   char message[3075];
 } notify_request_t;
 int sceKernelSendNotificationRequest(int, notify_request_t *, size_t, int);
+
+/* Network back-channel: the report is streamed to the PC, no FTP. */
+typedef uint32_t SceNetInAddr_t;
+int sceNetInit(size_t, int, size_t, int, size_t);
+int sceNetCtlInit(void);
+void sceNetCtlTerm(void);
+void sceNetTerm(void);
+struct SceNetSockaddrIn {
+  uint8_t sin_len;
+  uint8_t sin_family;
+  uint16_t sin_port;
+  SceNetInAddr_t sin_addr;
+  uint8_t sin_zero[8];
+};
+struct SceNetSockaddr {
+  uint8_t sa_len;
+  uint8_t sa_family;
+  uint16_t sa_port;
+  SceNetInAddr_t sa_addr;
+  uint8_t sa_zero[8];
+};
+int socket(int, int, int);
+typedef unsigned int socklen_t;
+int connect(int, const struct SceNetSockaddr *, socklen_t);
+ssize_t send(int, const void *, size_t, int);
+int close(int);
+#define AF_INET_ 2
+#define SOCK_STREAM_ 1
+
+/* The development PC on the LAN; the payload connects back here. */
+#define REPORT_HOST 192, 168, 0, 21
+#define REPORT_PORT 9999
+
+/* Streams the report file to the PC over TCP. Returns 0 on success. */
+static int SendReportToPc(const char *path)
+{
+  sceNetInit(128 * 1024, 0x20000, 0x10000, 0x20000, 0x10000);
+  sceNetCtlInit();
+
+  int s = socket(AF_INET_, SOCK_STREAM_, 0);
+  if (s < 0)
+    return -1;
+  struct SceNetSockaddrIn addr;
+  memset(&addr, 0, sizeof addr);
+  addr.sin_len = sizeof addr;
+  addr.sin_family = AF_INET_;
+  addr.sin_port = __builtin_bswap16((uint16_t)REPORT_PORT);
+  uint32_t ip = (REPORT_HOST);
+  addr.sin_addr = ip;
+
+  if (connect(s, (struct SceNetSockaddr *)&addr, sizeof addr) < 0)
+  {
+    close(s);
+    sceNetCtlTerm();
+    sceNetTerm();
+    return -2;
+  }
+
+  FILE *f = fopen(path, "r");
+  if (!f)
+  {
+    close(s);
+    sceNetCtlTerm();
+    sceNetTerm();
+    return -3;
+  }
+  char buf[4096];
+  size_t n;
+  while ((n = fread(buf, 1, sizeof buf, f)) > 0)
+    send(s, buf, n, 0);
+  fclose(f);
+  close(s);
+  sceNetCtlTerm();
+  sceNetTerm();
+  return 0;
+}
 
 /* ICD interface (defined by the RADV archive; declared by vk_icd.h). */
 extern PFN_vkVoidFunction vk_icdGetInstanceProcAddr(VkInstance, const char *);
@@ -89,16 +168,15 @@ int main(void)
       fprintf(out, "  %s v%u\n", e[i].extensionName, e[i].specVersion);
   }
 
-  /* 2. instance (VK_KHR_display + surface so the VideoOut swapchain path is live) */
+  /* 2. instance — zero extensiones: este spike solo enumera (sin swapchain),
+   * así que la cadena de funciones del surface no se cablea y el enlace pasa. */
   VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO, NULL, "ttt2-vkinfo", 1, NULL, 0, VK_MAKE_VERSION(1, 3, 0)};
-  const char *wantExt[] = {
-      VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_DISPLAY_EXTENSION_NAME,
-      VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME,
-      VK_EXT_DEBUG_UTILS_EXTENSION_NAME};
+  /* const char *wantExt[] = {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_DISPLAY_EXTENSION_NAME,
+      VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME, VK_EXT_DEBUG_UTILS_EXTENSION_NAME}; */
   VkInstanceCreateInfo ici = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
   ici.pApplicationInfo = &app;
-  ici.enabledExtensionCount = 4;
-  ici.ppEnabledExtensionNames = wantExt;
+  ici.enabledExtensionCount = 0;
+  ici.ppEnabledExtensionNames = NULL;
   VkInstance instance = VK_NULL_HANDLE;
   r = pCreateInstance(&ici, NULL, &instance);
   if (r != VK_SUCCESS)
@@ -306,6 +384,15 @@ int main(void)
 
   fprintf(out, "=== END vkinfo ===\n");
   fclose(out);
-  Notify("vkinfo OK: /data/ttt2-vkinfo.txt");
+  const char *paths[] = {"/data/ttt2-vkinfo.txt", "/user/ttt2-vkinfo.txt", "ttt2-vkinfo.txt"};
+  for (int i = 0; i < 3; ++i)
+  {
+    FILE *probe = fopen(paths[i], "r");
+    if (!probe) continue;
+    char tag[16];
+    if (fgets(tag, sizeof tag, probe)) { fclose(probe); SendReportToPc(paths[i]); break; }
+    fclose(probe);
+  }
+  Notify("vkinfo OK: report sent to PC");
   return 0;
 }
