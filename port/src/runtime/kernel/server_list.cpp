@@ -34,8 +34,8 @@
 #define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
 #endif
 
-#pragma comment(lib, "crypt32.lib")
-#pragma comment(lib, "ws2_32.lib")
+// (cross: dropped; the link line carries the lib)(lib, "crypt32.lib")
+// (cross: dropped; the link line carries the lib)(lib, "ws2_32.lib")
 
 namespace server_list {
 namespace {
@@ -175,7 +175,9 @@ void Load()
     g_store.servers.erase(std::remove_if(g_store.servers.begin(), g_store.servers.end(),
                                          [&](const Saved& s) { return !community::ParseAddress(s.address, host, port); }),
                           g_store.servers.end());
-    std::erase_if(g_store.bans, [](const Ban& b) { return b.address.empty() || !Active(b); });
+    g_store.bans.erase(std::remove_if(g_store.bans.begin(), g_store.bans.end(),
+                     [](const Ban& b) { return b.address.empty() || !Active(b); }),
+                    g_store.bans.end());
     std::fprintf(stderr, "[servers] %zu saved, network %s (%s)\n", g_store.servers.size(),
                  g_store.current.empty() ? "STEAM" : g_store.current.c_str(), FilePath().c_str());
 }
@@ -589,7 +591,9 @@ void SetBanned(const std::string& address, uint64_t until)
 {
     std::lock_guard l(g_mutex);
     Load();
-    std::erase_if(g_store.bans, [&](const Ban& b) { return SameAddress(b.address, address) || !Active(b); });
+    g_store.bans.erase(std::remove_if(g_store.bans.begin(), g_store.bans.end(),
+                     [&](const Ban& b) { return SameAddress(b.address, address) || !Active(b); }),
+                    g_store.bans.end());
     const Ban ban{ address, until };
     if (Active(ban) && g_store.bans.size() < kMaxSaved) g_store.bans.push_back(ban);
     Write();

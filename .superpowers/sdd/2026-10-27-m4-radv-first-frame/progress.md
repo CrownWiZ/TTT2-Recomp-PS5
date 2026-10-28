@@ -56,7 +56,13 @@ M3 cerrado antes de esto (f8f5656): ciclo validado en consola (3/3 burbujas, elf
 - **Task 5 (port host -ps5 + build): SIGUIENTE.**
 - Recordatorio de protocolo: aviso al usuario ANTES de cada lanzamiento/captura automática.
 
-## CHECKOLL Task 5 (28-10 noche) — estado honesto
+## CIERRE DE SESIÓN (28-10 15:19) — Task 5 a ~85%, resumible en frío
+
+- **Objetos: 456 en ~/m4/port-ps5/obj** — el PPC entero (+99 chunks), el kernel, los hosts, todo compilado. El ELF no cierra aún: la última tanda de undefineds = los stand-ins de la logística (hitch::GuestContexts/GameHeapOps) + GpuHwPresent/ReadFrontBuffer + sendmmsg/_setjmp de OpenSSL.
+- El stand-in `diag_hooks_ps5.cpp` define ya la registry + GuestEntryOfThread + GuestContextOf + GuestContexts + GameHeapOps; el siguiente paso = LA COMPILACIÓN de ese fichero y de los registros del renderer: `bash /root/pair.sh` (la sonda de los dos) → `bash /root/port_ps5.sh` (el enlace) hasta el tail sin undefineds.
+- El link line: los .a van TODOS en fila (DXVK build-dir + vkd3d + ffmpeg + libssl/libcrypto + los stubs AGC .so = el flujo build-radv-title verbatim).
+- La subida = los scripts M3 (m3_send_ftpsrv / el ftpsrv residente de M3 en :2121 + elfldr 9021) — Task 6.
+- **El estado del repo = CONSISTENTE**: todos los shims commiteados + el ledger = frío-executable.
 
 - **COMPLETOS Y SÓLIDOS:** `host_thread_ps5.cpp`, `audio_output_ps5.cpp`, `host_window_ps5.{h,cpp}`, `host_input_ps5.cpp`, `host_runtime_ps5.cpp`, `kernel/sce_ps5.h` — todos espejando los contratos de los Linux ya validados.
 - **A MEDIA TINTA (NO compila):** `host_vm_ps5.cpp` — la primera mitad está escrita (Armed/Dirty, pipe, spin-wake, single-step) pero con campos inventados del signal context (`__mc_saved_registers.??`): FALTA sondear la `ucontext_t`/`siginfo_t` de la libc del SDK (familia BSD vs Linux gregs) antes de cerrar el fichero. Faltan además: CancelNullPageStep, ReserveGuest (con el fork de memoria directa para el alias del espejo — NO memfd), ReleaseGuest, y las primitives restantes (QueryReadRegion con memcpy del rango informado, Protect, ResetWriteWatch, TakeWriteWatch, PrepareHostWrite, ProtectForRollback, LastError).

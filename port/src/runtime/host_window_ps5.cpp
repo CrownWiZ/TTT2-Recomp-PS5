@@ -85,7 +85,7 @@ Window* Open(uint32_t width, uint32_t height)
     shell.mapping = mapped;
     std::memset(mapped, 0, total);
     shell.frames[0] = static_cast<uint32_t*>(mapped);
-    shell.frames[1] = static_cast<uint32_t*>(static_cast<char*>(mapped) + shell.frameBytes);
+    shell.frames[1] = reinterpret_cast<uint32_t*>(static_cast<char*>(mapped) + shell.frameBytes);
 
     SceVideoOutBufferAttributeV2 attribute{};
     attribute.pixelFormat = SCE_VIDEO_OUT_PIXEL_FORMAT_B8_G8_R8_X8;

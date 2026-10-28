@@ -1,6 +1,6 @@
 #include "host_udp.h"
 
-#if !defined(__linux__)
+#if !defined(__linux__) && !defined(TTT2_HOST_PS5)
 #error "This UDP backend requires Linux"
 #endif
 

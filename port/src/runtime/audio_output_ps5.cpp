@@ -29,7 +29,7 @@ AudioPcmConversion ConvertAudioPcm(const uint8_t* guest,
             const uint8_t* p = guest + (channel * AUDIO_PCM_SAMPLES + sample) * 4;
             const uint32_t bits = (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) |
                                   (uint32_t(p[2]) << 8) | uint32_t(p[3]);
-            float value = std::bit_cast<float>(bits);
+            float value = __builtin_bit_cast(float, bits);
             if (!std::isfinite(value)) { value = 0; ++result.nonfinite; }
             result.nonzero |= value != 0;
             interleaved[sample * AUDIO_PCM_CHANNELS + channel] = value;

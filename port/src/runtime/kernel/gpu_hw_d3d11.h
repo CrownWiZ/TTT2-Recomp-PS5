@@ -48,7 +48,7 @@
 #include <dxgi1_2.h>
 #if defined(_WIN32)
 #include <dwmapi.h>
-#pragma comment(lib, "dwmapi.lib")
+// (cross: dropped; the link line carries the lib)(lib, "dwmapi.lib")
 #else
 #include <time.h>
 #include <fcntl.h>
@@ -57,9 +57,9 @@
 #include <unistd.h>
 #endif
 #include <d3dcompiler.h>
-#if defined(__linux__)
+#if defined(__linux__) || defined(TTT2_HOST_PS5)
 #include "dxvk_native_com_ptr.h"
-#include <wsi/native_sdl3.h>
+#include <wsi/native_wsi.h>
 #else
 #include <wrl/client.h>
 #endif
@@ -73,6 +73,7 @@
 #include <limits>
 #include <chrono>
 #include <atomic>
+#include "cxx20_compat.h"
 #include <filesystem>
 #if defined(_WIN32)
 #include <intrin.h>
@@ -512,7 +513,7 @@ public:
     // vertex data uploaded. Fallback: nothing was changed, run the CPU vertex stage instead.
     GpuVsResult DrawGpuVs(const uint32_t* regs, const std::vector<uint32_t>& psCode,
                           VertexShaderHandle& shader,
-                          std::span<const uint32_t> indices, uint32_t minIndex, uint32_t maxIndex, const DrawState& st,
+                          ttt2_c20::span<const uint32_t> indices, uint32_t minIndex, uint32_t maxIndex, const DrawState& st,
                           bool triangleStrip = false, uint32_t stripTriangles = 0, uint64_t indexIdentity = 0)
     {
         auto& vs = static_cast<VsEntry&>(shader);
@@ -4530,7 +4531,7 @@ private:
         using clock = std::chrono::steady_clock;
         const auto t1 = clock::now();
         const ResolveWritebackInfo info{ dest, r.pitch, r.height, r.depth, r.depthFloat, r.rg16f, r.swapRB };
-        if (!ScatterResolvedWords(info, std::span<const uint32_t>(px),
+        if (!ScatterResolvedWords(info, ttt2_c20::span<const uint32_t>(px),
                                   [&](uint32_t address, uint32_t word) { GWrite32(g_base, address, word); }))
             throw Failure("invalid resolved guest writeback");
         dirty_.Sync(dest, r.size);

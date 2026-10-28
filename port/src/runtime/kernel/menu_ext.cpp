@@ -1,4 +1,6 @@
+#if !defined(TTT2_HOST_PS5)
 #include <SDL3/SDL.h>
+#endif
 // PC menu extensions (plan and reverse-engineering notes: port/MENU_PLAN.md).
 //
 // TTT2's menus are BX01 binary-XML documents (frames, menus, rows, value lists) whose event
@@ -556,12 +558,18 @@ void UpdateBox(PPCContext& ctx, uint8_t* base, const BoxState& b)
 std::string ClipboardText()
 {
     std::string out;
-    char* text = SDL_GetClipboardText();
+    char* text = nullptr;
+#if !defined(TTT2_HOST_PS5)
+    text = SDL_GetClipboardText();
+#endif
+    // The console has no clipboard: the profile-name dialog starts empty.
     if (text)
     {
         for (size_t i = 0; text[i] && text[i] != '\r' && text[i] != '\n' && out.size() < 512; ++i)
             if (text[i] >= 0x20 && text[i] < 0x7F) out.push_back(text[i]);
+#if !defined(TTT2_HOST_PS5)
         SDL_free(text);
+#endif
     }
     return out;
 }

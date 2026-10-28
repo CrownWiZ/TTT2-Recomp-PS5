@@ -14,6 +14,7 @@
 // table can now be referenced from two threads. TTT2_CTAB_CACHE=0 turns the cache off.
 #include "kernel_shared.h"
 #include <atomic>
+#include "atomic_ref_compat.h"
 #include <cstdlib>
 #include <cstring>
 #include <unordered_map>
@@ -37,7 +38,7 @@ bool On()
 uint32_t AddCount(uint8_t* base, uint32_t object, int32_t delta)
 {
     auto& word = *reinterpret_cast<uint32_t*>(base + object + 4);
-    std::atomic_ref<uint32_t> count(word);
+    ttt2_c20::atomic_ref<uint32_t> count(word);
     uint32_t seen = count.load(std::memory_order_relaxed);
     for (;;)
     {

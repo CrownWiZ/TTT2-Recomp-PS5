@@ -1,3 +1,4 @@
+#include "cxx20_compat.h"
 #pragma once
 
 #include <algorithm>
@@ -15,7 +16,7 @@ enum class IndexPrimitive : uint32_t { Triangles = 4, Fan = 5, Strip = 6, Quads 
 
 struct TriangleIndices
 {
-    std::span<const uint32_t> values;
+    ttt2_c20::span<const uint32_t> values;
     uint32_t lowest = 0, highest = 0;
 };
 
@@ -24,7 +25,7 @@ struct StripIndices : TriangleIndices
     uint32_t triangles = 0;
 };
 
-inline std::pair<uint32_t, uint32_t> IndexBounds(std::span<const uint32_t> indices)
+inline std::pair<uint32_t, uint32_t> IndexBounds(ttt2_c20::span<const uint32_t> indices)
 {
 #if defined(TTT2_GEOMETRY_AB_PROBE)
     if (geometry_probe::ReferenceMask() & 32)
@@ -47,8 +48,8 @@ inline std::pair<uint32_t, uint32_t> IndexBounds(std::span<const uint32_t> indic
 // Decoded guest indices are 24-bit. UINT32_MAX is therefore available as the
 // D3D11 R32 strip restart sentinel. Preserve segment parity and omit segments
 // too short to produce a triangle, matching the list path's fetch bounds.
-inline StripIndices BuildNativeStripIndices(std::span<const uint32_t> idx,
-    std::span<const uint8_t> cuts, std::vector<uint32_t>& scratch)
+inline StripIndices BuildNativeStripIndices(ttt2_c20::span<const uint32_t> idx,
+    ttt2_c20::span<const uint8_t> cuts, std::vector<uint32_t>& scratch)
 {
     StripIndices result;
     if (idx.size() < 3) return result;
@@ -81,7 +82,7 @@ inline StripIndices BuildNativeStripIndices(std::span<const uint32_t> idx,
         }
         start = end;
     }
-    result.values = std::span<const uint32_t>(scratch.data(), count);
+    result.values = ttt2_c20::span<const uint32_t>(scratch.data(), count);
     if (count) { result.lowest = lowest; result.highest = highest; }
     return result;
 }
@@ -90,7 +91,7 @@ inline StripIndices BuildNativeStripIndices(std::span<const uint32_t> idx,
 // elements. Keep scratch at its high-water size: subsequent draws overwrite its
 // live prefix without zero-filling it or checking capacity for every index.
 inline TriangleIndices BuildTriangleIndices(IndexPrimitive primitive,
-    std::span<const uint32_t> idx, std::span<const uint8_t> cuts,
+    ttt2_c20::span<const uint32_t> idx, ttt2_c20::span<const uint8_t> cuts,
     std::vector<uint32_t>& scratch)
 {
     TriangleIndices result;
@@ -151,7 +152,7 @@ inline TriangleIndices BuildTriangleIndices(IndexPrimitive primitive,
             s = e;
         }
     }
-    result.values = std::span<const uint32_t>(scratch.data(), count);
+    result.values = ttt2_c20::span<const uint32_t>(scratch.data(), count);
     if (count) { result.lowest = lowest; result.highest = highest; }
     return result;
 }

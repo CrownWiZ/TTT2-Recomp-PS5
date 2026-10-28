@@ -1,7 +1,7 @@
 #include "host_settings_platform.h"
 #include "../host_storage.h"
 
-#if !defined(__linux__)
+#if !defined(__linux__) && !defined(TTT2_HOST_PS5)
 #error "This settings backend requires Linux"
 #endif
 

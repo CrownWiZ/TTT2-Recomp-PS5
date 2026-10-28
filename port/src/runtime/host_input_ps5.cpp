@@ -4,7 +4,7 @@
 // does. Buttons map to the Xbox style values the guest ABI expects (the same
 // mapping the SDL ApplyGamepadButton helpers produce). Keyboard emulation is
 // empty: the console has no keyboard in the M4 scope.
-#include "host_input_ps5.h"
+#include "host_input_sdl.h"
 #include "kernel/sce_ps5.h"
 #include "host_thread.h"
 

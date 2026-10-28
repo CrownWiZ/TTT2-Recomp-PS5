@@ -1,3 +1,4 @@
+#include "cxx20_compat.h"
 #pragma once
 
 #include "gpu_render.h"
@@ -54,7 +55,7 @@ inline uint32_t ResolvedGuestWord(const ResolveWritebackInfo& info, uint32_t wor
 // to run independently for large resolves.
 template <class WriteWord>
 bool ScatterResolvedWords(const ResolveWritebackInfo& info,
-                          std::span<const uint32_t> linear,
+                          ttt2_c20::span<const uint32_t> linear,
                           WriteWord&& writeWord)
 {
     if (!info.pitch || !info.height ||
@@ -120,8 +121,8 @@ inline bool BuildResolvedTileLookup(const ResolveWritebackInfo& info,
 
 template <class WriteWord>
 bool ScatterResolvedWordsRange(const ResolveWritebackInfo& info,
-                               std::span<const uint32_t> linear,
-                               std::span<const uint32_t> tiledToLinear,
+                               ttt2_c20::span<const uint32_t> linear,
+                               ttt2_c20::span<const uint32_t> tiledToLinear,
                                uint32_t start, uint32_t size, WriteWord&& writeWord)
 {
     if (uint64_t(info.pitch) * info.height > linear.size() ||

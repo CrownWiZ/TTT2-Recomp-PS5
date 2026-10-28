@@ -9,10 +9,10 @@
 #include <cstdio>
 #include <cstring>
 
-#pragma comment(lib, "secur32.lib")
-#pragma comment(lib, "crypt32.lib")
-#pragma comment(lib, "bcrypt.lib")
-#pragma comment(lib, "ws2_32.lib")
+// (cross: dropped; the link line carries the lib)(lib, "secur32.lib")
+// (cross: dropped; the link line carries the lib)(lib, "crypt32.lib")
+// (cross: dropped; the link line carries the lib)(lib, "bcrypt.lib")
+// (cross: dropped; the link line carries the lib)(lib, "ws2_32.lib")
 
 namespace community {
 namespace {

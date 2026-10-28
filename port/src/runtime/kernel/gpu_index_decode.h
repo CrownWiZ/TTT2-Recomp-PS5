@@ -1,3 +1,4 @@
+#include "cxx20_compat.h"
 #pragma once
 
 #include <algorithm>
@@ -15,8 +16,8 @@ struct IndexDecodeStorage
 };
 struct DecodedIndices
 {
-    std::span<const uint32_t> indices;
-    std::span<const uint8_t> cuts;
+    ttt2_c20::span<const uint32_t> indices;
+    ttt2_c20::span<const uint8_t> cuts;
     uint32_t highest = 0;
     bool anyCut = false;
 };
@@ -40,14 +41,14 @@ inline DecodedIndices DecodeIndexLoop(const uint8_t* guest, uint32_t address, ui
         {
             uint16_t value;
             std::memcpy(&value, guest + uint32_t(address + i * 2), 2);
-            if constexpr (std::endian::native == std::endian::little)
+            if constexpr (ttt2_c20::endian::native == ttt2_c20::endian::little)
                 value = uint16_t((value >> 8) | (value << 8));
             raw = value;
         }
         else
         {
             std::memcpy(&raw, guest + uint32_t(address + i * 4), 4);
-            if constexpr (std::endian::native == std::endian::little)
+            if constexpr (ttt2_c20::endian::native == ttt2_c20::endian::little)
                 raw = (raw >> 24) | ((raw >> 8) & 0xFF00) | ((raw << 8) & 0xFF0000) | (raw << 24);
         }
         const bool cut = Restart && raw == restartIndex;

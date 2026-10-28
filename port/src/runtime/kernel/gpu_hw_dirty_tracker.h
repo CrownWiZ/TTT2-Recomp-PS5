@@ -1,3 +1,4 @@
+#include "cxx20_compat.h"
 #pragma once
 
 #include "../host_vm.h"
@@ -22,7 +23,7 @@ namespace ttt2_hw {
 
 // Clip once so the remaining unsigned maximum reduction can be vectorized on
 // both x86 and ARM. These are page sequence counters, not texture pixels.
-inline uint32_t NewestPageSequence(std::span<const uint32_t> pages,
+inline uint32_t NewestPageSequence(ttt2_c20::span<const uint32_t> pages,
                                    uint32_t start, uint32_t size)
 {
     if (!size) return 0;

@@ -1,3 +1,4 @@
+#include "cxx20_compat.h"
 #pragma once
 
 #include <algorithm>
@@ -19,7 +20,7 @@ public:
 
     bool empty() const { return pages_.empty(); }
     size_t size() const { return pages_.size(); }
-    std::span<const uint32_t> Raw() const { return pages_; }
+    ttt2_c20::span<const uint32_t> Raw() const { return pages_; }
 
     void Ensure(size_t count) {
         if (pages_.size() >= count) return;

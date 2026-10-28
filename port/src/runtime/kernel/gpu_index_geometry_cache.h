@@ -4,6 +4,7 @@
 #include "gpu_index_decode.h"
 #include <cstring>
 #include <atomic>
+#include "cxx20_compat.h"
 #include <unordered_map>
 
 namespace ttt2_hw {
@@ -90,7 +91,7 @@ public:
         auto& result = entry.result;
         result.decoded = DecodeIndices(entry.source.data(), 0, key.count, false, key.index32,
             key.restart, key.restartIndex, key.offset, key.minimum, key.maximum, entry.storage);
-        const auto cuts = result.decoded.anyCut ? result.decoded.cuts : std::span<const uint8_t>{};
+        const auto cuts = result.decoded.anyCut ? result.decoded.cuts : ttt2_c20::span<const uint8_t>{};
         if (primitive == IndexPrimitive::Strip)
         {
             const auto strip = BuildNativeStripIndices(result.decoded.indices, cuts, entry.scratch);

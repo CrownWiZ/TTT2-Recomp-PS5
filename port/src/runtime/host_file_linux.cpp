@@ -476,7 +476,9 @@ void Close(File* file)
         if (mark.owner == file) mark.owner = nullptr;
     if (file->fd >= 0) close(file->fd);
     if (file->parent >= 0) close(file->parent);
-    if (file->tracked) std::erase(g_openFiles, file);
+    if (file->tracked)
+        g_openFiles.erase(std::remove(g_openFiles.begin(), g_openFiles.end(), file),
+                          g_openFiles.end());
     const bool last = std::none_of(g_openFiles.begin(), g_openFiles.end(),
         [file](const File* other) {
             return other->device == file->device && other->inode == file->inode;

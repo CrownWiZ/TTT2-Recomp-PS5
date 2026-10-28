@@ -36,6 +36,7 @@
 #include "host_settings.h"
 #endif
 #include <atomic>
+#include "cxx20_compat.h"
 #include <emmintrin.h>
 #include <condition_variable>
 #include <functional>
@@ -2616,7 +2617,7 @@ bool GpuExecuteDraw(const uint32_t* regs, uint32_t initiator, uint32_t indexAddr
             else if (nativeStrip)
             {
                 const auto strip = ttt2_hw::BuildNativeStripIndices(idx,
-                    anyCut ? std::span<const uint8_t>(cut) : std::span<const uint8_t>{}, triangleScratch);
+                    anyCut ? ttt2_c20::span<const uint8_t>(cut) : ttt2_c20::span<const uint8_t>{}, triangleScratch);
                 assembled = strip;
                 stripTriangles = strip.triangles;
             }
@@ -2630,7 +2631,7 @@ bool GpuExecuteDraw(const uint32_t* regs, uint32_t initiator, uint32_t indexAddr
 #endif
                     assembled = ttt2_hw::BuildTriangleIndices(
                         static_cast<ttt2_hw::IndexPrimitive>(prim), idx,
-                        anyCut ? std::span<const uint8_t>(cut) : std::span<const uint8_t>{}, triangleScratch);
+                        anyCut ? ttt2_c20::span<const uint8_t>(cut) : ttt2_c20::span<const uint8_t>{}, triangleScratch);
             }
             const auto tri = assembled.values;
             const uint32_t lowest = assembled.lowest, highest = assembled.highest;

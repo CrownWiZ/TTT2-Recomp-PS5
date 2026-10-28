@@ -757,7 +757,9 @@ static void PollInjectFile(PadScript& s, uint64_t now)
     const char* path = injectPath.c_str();
     FILE* f = std::fopen(path, "r");
     if (!f) return;
-    std::erase_if(s.presses, [now](const ScriptedPress& p) { return p.until < now; });
+    s.presses.erase(std::remove_if(s.presses.begin(), s.presses.end(),
+                     [now](const ScriptedPress& p) { return p.until < now; }),
+                    s.presses.end());
     char line[128];
     uint64_t at = (std::max)(now, s.injectBusyUntil), previous = at;
     static int logged = 0;

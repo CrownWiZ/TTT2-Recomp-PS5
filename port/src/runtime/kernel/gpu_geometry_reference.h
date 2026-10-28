@@ -1,3 +1,4 @@
+#include "cxx20_compat.h"
 #pragma once
 // Frozen pre-optimization implementations for the opt-in Linux A/B probe and
 // standalone correctness checks. Normal game builds do not include this file.
@@ -35,7 +36,7 @@ inline DecodedIndices DecodeIndices(const uint8_t* guest, uint32_t address, uint
 }
 // Frozen pre-optimization assembly, kept as an independent output oracle.
 inline ttt2_hw::TriangleIndices BuildTriangleIndices(IndexPrimitive primitive,
-    std::span<const uint32_t> idx, std::span<const uint8_t> cut,
+    ttt2_c20::span<const uint32_t> idx, ttt2_c20::span<const uint8_t> cut,
     std::vector<uint32_t>& tri)
 {
     const uint32_t n = uint32_t(idx.size());

@@ -6,14 +6,14 @@
 // exports NvOptimusEnablement / AmdPowerXpressRequestHighPerformance, main.cpp). TTT2_GPU_ADAPTER=<n>
 // picks DXGI's n-th adapter. Every adapter is listed in the log once.
 #include <dxgi1_6.h>
-#if defined(__linux__)
+#if defined(__linux__) || defined(TTT2_HOST_PS5)
 #include "dxvk_native_com_ptr.h"
 #else
 #include <wrl/client.h>
 #endif
 #include <cstdio>
 #include <cstdlib>
-#pragma comment(lib, "dxgi.lib")
+// (cross: dropped; the link line carries the lib)(lib, "dxgi.lib")
 
 inline Microsoft::WRL::ComPtr<IDXGIAdapter1> PreferredGpuAdapter()
 {

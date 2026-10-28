@@ -6,6 +6,7 @@
 #include "kernel_trace.h"
 #include "../host_thread.h"
 #include <atomic>
+#include "atomic_ref_compat.h"
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -242,7 +243,7 @@ static void SpinAcquire(uint8_t* base, uint32_t ga)
 {
     // The first 64 KiB are the guarded null region, not a usable lock word.
     if (ga <= 0x10000u - sizeof(uint32_t)) return;
-    std::atomic_ref<uint32_t> lock(*reinterpret_cast<uint32_t*>(base + ga));
+    ttt2_c20::atomic_ref<uint32_t> lock(*reinterpret_cast<uint32_t*>(base + ga));
     uint32_t expected = 0;
     while (!lock.compare_exchange_weak(expected, 1, std::memory_order_acquire,
                                        std::memory_order_relaxed))
@@ -254,7 +255,7 @@ static void SpinAcquire(uint8_t* base, uint32_t ga)
 static void SpinRelease(uint8_t* base, uint32_t ga)
 {
     if (ga <= 0x10000u - sizeof(uint32_t)) return;
-    std::atomic_ref<uint32_t>(*reinterpret_cast<uint32_t*>(base + ga))
+    ttt2_c20::atomic_ref<uint32_t>(*reinterpret_cast<uint32_t*>(base + ga))
         .store(0, std::memory_order_release);
 }
 

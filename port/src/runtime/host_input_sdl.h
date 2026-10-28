@@ -1,6 +1,9 @@
 #pragma once
 
-#include <SDL3/SDL.h>
+// Snapshot-only contract: this header is included by kernel modules on every
+// host platform, so it carries no SDL types. The SDL event-thread glue
+// (Event/LegacyKey/Apply*) moved to host_input_sdl_events.h, included only by
+// host_window_sdl.cpp.
 #include <array>
 #include <cstdint>
 
@@ -30,16 +33,9 @@ bool Start();
 void Stop();
 void Tick();
 void SetFocused(bool focused);
-void Event(const SDL_Event& event);
 Snapshot Read();
 bool KeyDown(int legacyKey);
 bool AnyKeyDown();
 bool Focused();
-
-// Existing keyboard settings use Windows virtual-key numbers. Keep them stable
-// while SDL takes ownership of event collection on all host platforms.
-int LegacyKey(SDL_Keycode key);
-void ApplyGamepadButton(Pad& pad, SDL_GamepadButton button, bool down);
-void ApplyGamepadAxis(Pad& pad, SDL_GamepadAxis axis, int16_t value);
 
 } // namespace host_input

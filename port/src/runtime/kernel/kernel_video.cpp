@@ -42,6 +42,7 @@
 #include "display_settings.h"
 #include <algorithm>
 #include <atomic>
+#include "atomic_ref_compat.h"
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
@@ -137,8 +138,10 @@ static void DebugDirectory(const char* path)
 // The swap packet carries the frontbuffer TEXTURE FETCH BLOCK; we decode the surface
 // address from it and show the surface in a host window (and periodically dump a BMP
 // for headless verification). Even a black frame proves the flip chain end-to-end.
-#pragma comment(lib, "user32.lib")
-#pragma comment(lib, "synchronization.lib")
+#if !defined(TTT2_HOST_PS5)
+// (cross: dropped; the link line carries the lib)(lib, "user32.lib")
+// (cross: dropped; the link line carries the lib)(lib, "synchronization.lib")
+#endif
 
 static std::atomic<uint32_t> g_frontBufferPhys{0};   // guest address of the displayed surface
 // The displayed surface's fetch-constant swizzle (12 bits). TTT2's is .zyx1 (0xA0A): it swaps
@@ -475,8 +478,10 @@ static void RetireQueuedFlips()
 {
     const uint32_t dev = g_intrContext.load();
     if (!dev) return;
-    std::atomic_ref<uint32_t> lock(*reinterpret_cast<uint32_t*>(g_base + dev + kFlipLock));
-    while (lock.exchange(1, std::memory_order_acquire) != 0) _mm_pause();
+    // atomic_ref is absent from the console libc++ build; the __atomic
+    // builtins apply the same operations on the aligned guest lock word.
+    auto* lockWord = reinterpret_cast<uint32_t*>(g_base + dev + kFlipLock);
+    while (__atomic_exchange_n(lockWord, 1u, __ATOMIC_ACQUIRE) != 0) _mm_pause();
     const uint32_t tail = GRead32(g_base, dev + kFlipTail), shadow = GRead32(g_base, dev + kScratchShadow);
     uint32_t head = GRead32(g_base, dev + kFlipHead);
     for (; head != tail; ++head)
@@ -489,7 +494,7 @@ static void RetireQueuedFlips()
     GWrite32(g_base, dev + kFlipHead, head);
     const uint32_t now = GRead32(g_base, dev + kVblanks);
     if (int32_t(GRead32(g_base, dev + kLastDue) - now) > 0) GWrite32(g_base, dev + kLastDue, now);   // next swap: next vblank
-    lock.store(0, std::memory_order_release);
+    __atomic_store_n(lockWord, 0u, __ATOMIC_RELEASE);
 }
 
 bool GpuRingDrained();

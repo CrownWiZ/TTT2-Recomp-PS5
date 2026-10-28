@@ -11,13 +11,13 @@ inline uint32_t Read(uint8_t *base, uint32_t address) {
       *reinterpret_cast<const volatile uint32_t *>(base + address));
 }
 inline double ReadFloat(uint8_t *base, uint32_t address) {
-  return double(std::bit_cast<float>(Read(base, address)));
+  return double(__builtin_bit_cast(float, Read(base, address)));
 }
 inline void Write(uint8_t *base, uint32_t address, uint32_t value) {
   guest_memory::StoreScalar(base, address, __builtin_bswap32(value));
 }
 inline void WriteFloat(uint8_t *base, uint32_t address, double value) {
-  Write(base, address, std::bit_cast<uint32_t>(float(value)));
+  Write(base, address, __builtin_bit_cast(uint32_t, float(value)));
 }
 inline bool RunCombFilter(PPCContext &ctx, uint8_t *base) {
   // Forward only stores that cannot be swallowed by guest low-memory
@@ -32,7 +32,7 @@ inline bool RunCombFilter(PPCContext &ctx, uint8_t *base) {
   ctx.fpscr.disableFlushMode();
   const double zero = ReadFloat(base, 0x820F19F4);
   double sample = ReadFloat(base, buffer + offset);
-  const uint32_t sampleBits = std::bit_cast<uint32_t>(float(sample));
+  const uint32_t sampleBits = __builtin_bit_cast(uint32_t, float(sample));
   Write(base, scratch, sampleBits);
   ctx.cr0.compare<int32_t>(sampleBits & 0x7F800000u, 0, ctx.xer);
   if (ctx.cr0.eq)
@@ -44,7 +44,7 @@ inline bool RunCombFilter(PPCContext &ctx, uint8_t *base) {
   const double previous = ReadFloat(base, state + 4);
   const double feedback = ReadFloat(base, state + 8);
   filtered = double(float(feedback * previous + filtered));
-  const uint32_t filteredBits = std::bit_cast<uint32_t>(float(filtered));
+  const uint32_t filteredBits = __builtin_bit_cast(uint32_t, float(filtered));
   Write(base, state + 4, filteredBits);
   const uint32_t exponent = filteredBits & 0x7F800000u;
   ctx.cr0.compare<int32_t>(exponent, 0, ctx.xer);

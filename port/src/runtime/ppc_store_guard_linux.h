@@ -3,8 +3,8 @@
 // Injected only into generated PPC translation units. Their scalar store macros
 // are overridable, while vector stores, dcbz and stwcx write directly to the
 // guest base. Handle all four forms before the process-wide null-page fallback.
-#if !defined(__linux__)
-#error "The generated PPC store guard requires Linux"
+#if !defined(__linux__) && !defined(TTT2_HOST_PS5)
+#error "The generated PPC store guard requires Linux or the PS5 build"
 #endif
 
 #include <atomic>
