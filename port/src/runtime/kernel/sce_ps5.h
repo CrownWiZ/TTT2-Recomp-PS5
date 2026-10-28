@@ -8,6 +8,10 @@
 
 #ifdef __PROSPERO__
 
+// Every entry point below lives in a system module and is exported unmangled:
+// without this block the C++ declarations mangle and the imports never bind.
+extern "C" {
+
 // --- libkernel: notification + faults -------------------------------------------------
 
 typedef struct notify_request {
@@ -69,7 +73,9 @@ int sceVideoOutGetResolutionStatus2(int32_t handle, int32_t resolutionOption,
                                     SceVideoOutResolutionStatus *status);
 int sceVideoOutRegisterBuffers2(int32_t handle, int32_t startIndex, int32_t bufferNum,
                                 const void *bufferMem[], const SceVideoOutBufferAttributeV2 *attribute);
-int sceVideoOutSubmitFlip2(int32_t handle, int32_t bufferIndex, int32_t flipMode, int64_t flipArg);
+// The SDK's import stub exports SubmitFlip (5.x titles keep it); SubmitFlip2 is
+// not in the module's stub table, so the plain entry point is the one that binds.
+int sceVideoOutSubmitFlip(int32_t handle, int32_t bufferIndex, int32_t flipMode, int64_t flipArg);
 int sceVideoOutClose(int32_t handle);
 
 // --- libkernel: direct memory (GPU/VideoOut buffers) ----------------------------------
@@ -134,5 +140,7 @@ int scePadInit();
 int scePadOpen(int32_t userId, int32_t type, int32_t index, const void *param);
 int scePadRead(int32_t handle, ScePadData *data, int32_t n);
 int scePadClose(int32_t handle);
+
+} // extern "C"
 
 #endif // __PROSPERO__

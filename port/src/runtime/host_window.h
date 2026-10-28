@@ -13,4 +13,8 @@ struct NativeSurface {
 
 NativeSurface GetNativeSurface(Window* window);
 
+// Size of the drawable surface in pixels. On the console there is no window to
+// query, so the video shell answers instead of the OS.
+void DisplaySize(uint32_t* width, uint32_t* height);
+
 } // namespace host_window

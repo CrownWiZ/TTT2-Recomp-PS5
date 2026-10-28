@@ -53,8 +53,8 @@
 
 ### Task 5: Host `-ps5` del port + build completo
 
-- [ ] `port/` target PS5: filesystem (FTP//data), host_vm (memoria directa, sin guard página 0), input (scePad), audio (sceAudioOut), video shell.
-- [ ] Enlace: port + DXVK estático + RADV whole + FFmpeg XMA + vkd3d-shader + SDK (receta radv-link + emutls-cxa).
+- [x] `port/` target PS5: filesystem (FTP//data), host_vm (memoria directa, sin guard página 0), input (scePad), audio (sceAudioOut), video shell.
+- [x] Enlace: port + DXVK estático + RADV whole + FFmpeg XMA + vkd3d-shader + SDK (receta radv-link + emutls-cxa) → `llvm-pie.elf` 216 MB, `_start` en 0x5174140, cero undefineds (28-10 18:26).
 
 ### Task 6: Primer frame en la TV
 

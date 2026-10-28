@@ -133,7 +133,7 @@ bool Blit(Window* window, const uint32_t* bgrx, uint32_t width, uint32_t height)
     if (width != shell.width || height != shell.height) return false;
     uint32_t* frame = shell.frames[shell.nextFrame];
     std::memcpy(frame, bgrx, shell.frameBytes);
-    if (sceVideoOutSubmitFlip2(shell.videoOut, shell.nextFrame, 1 /*queue*/, 0) != 0)
+    if (sceVideoOutSubmitFlip(shell.videoOut, shell.nextFrame, 1 /*queue*/, 0) != 0)
         return false;
     shell.nextFrame ^= 1;
     return true;
@@ -156,6 +156,14 @@ NativeSurface GetNativeSurface(Window* window)
     NativeSurface surface;
     surface.window = window ? kDisplayWindowToken : 0;
     return surface;
+}
+
+void DisplaySize(uint32_t* width, uint32_t* height)
+{
+    auto& shell = VideoShell();
+    std::lock_guard lock(shell.mutex);
+    if (width) *width = shell.width;
+    if (height) *height = shell.height;
 }
 
 } // namespace host_window

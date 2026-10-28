@@ -11,6 +11,7 @@ radv_archive=/root/m4/radv-build2/src/amd/vulkan/libvulkan_radeon.a
 cache=/root/.cache/ttt2-platform
 work=/root/m4/port-ps5
 stubs=/root/m4/dxvk-stubs
+dxvk_build=/root/m4/dxvk-ps5-build
 dxvk_src=$(ls -dt $cache/shared-dxvk/source-*/ | head -n 1)
 
 export PATH="/usr/lib/llvm-18/bin:/usr/bin:/bin"
@@ -35,12 +36,14 @@ inc=(
     "-I$cache/ps5-ffmpeg-xma/source"
     "-I$cache/ps5-ffmpeg-xma/source/compat/stdbit"
     "-I$cache/vkd3d-ps5/usr/include"
+    "-I$cache/vkd3d-1.19-ps5/include"
     "-I$cache/ps5-openssl/include"
 )
 
 defines=(
     -DTTT2_HOST_PS5=1 -DTTT2_LOCAL_SAVES=1 -DTTT2_HAVE_STEAM=0
     -DTTT2_GPU_HW_BACKEND=1 -DTTT2_GPU_HW_D3D11=1 -DTTT2_D3D11_MOVIE_BACKEND=1
+    -DDXVK_WSI_DISPLAY=1
 )
 
 cxx() { "$sdk/bin/prospero-clang++" "$@"; }
@@ -92,6 +95,7 @@ runtime_sources=(
     "host_udp_linux.cpp"
     "host_vm_ps5.cpp" "host_thread_ps5.cpp" "audio_output_ps5.cpp"
     "host_window_ps5.cpp" "host_input_ps5.cpp" "host_runtime_ps5.cpp"
+    "ps5_entry.cpp"
     "main.cpp"
 )
 host_failed=0
@@ -105,7 +109,7 @@ done
 
 # --- renderer ---------------------------------------------------------------------------
 for src in "kernel/gpu_render.cpp" "native_d3dcompiler.cpp"; do
-    out=$work/obj/rdr_$(basename "$src")
+    out=$work/obj/rdr_$(basename "$src" .cpp).o
     if [[ -f $out && $out -nt "$runtime/$src" ]]; then continue; fi
     cxx -O2 -Wno-everything "${defines[@]}" "${inc[@]}" \
         -c "$runtime/$src" -o "$out" || host_failed=1 &
@@ -116,7 +120,7 @@ done
 kernel_files=()
 for f in "$runtime"/kernel/*.cpp; do
     case "$(basename "$f")" in
-        data_watch.cpp|diag_hooks.cpp|steam_bridge.cpp|steam_bridge_linux.cpp| \
+        data_watch.cpp|diag_hooks.cpp|diag_hooks_linux.cpp|steam_bridge.cpp|steam_bridge_linux.cpp| \
         host_settings_windows.cpp|gpu_render.cpp|xma.cpp)
             continue ;;
     esac
@@ -155,7 +159,8 @@ done
 
 "$sdk/bin/prospero-lld" "${radv_linker_script[@]}" --eh-frame-hdr "${radv_link_flags[@]}" \
     --version-script "$radv_root/tooling/native/app-symbols.map" \
-    --as-needed "$sdk"/target/lib/*.so \
+    --exclude-libs=ALL \
+    --allow-multiple-definition \
     -e _start -o "$work/llvm-pie.elf" \
     "$work"/obj/*.o \
     "$cache/vkd3d-ps5-build/.libs/libvkd3d-shader.a" \
@@ -165,7 +170,24 @@ done
     "$cache/ps5-openssl/lib/libcrypto.a" \
     "$work/stubs/libSceAgc.so" \
     "$work/stubs/libSceAgcDriver.so" \
+    --start-group \
+        "$dxvk_build"/src/d3d11/d3d11_static.a \
+        "$dxvk_build"/src/dxgi/dxgi_static.a \
+        "$dxvk_build"/src/dxvk/libdxvk.a \
+        "$dxvk_build"/src/dxbc/libdxbc.a \
+        "$dxvk_build"/src/spirv/libspirv.a \
+        "$dxvk_build"/src/util/libutil.a \
+        "$dxvk_build"/src/vulkan/libvkcommon.a \
+        "$dxvk_build"/src/wsi/libwsi.a \
+    --end-group \
     "${radv_link_inputs[@]}" \
-    --as-needed "$stubs"/libvulkan.a "$stubs"/libpthread.a "$stubs"/libm.a
+    --as-needed "$stubs"/libvulkan.a "$stubs"/libpthread.a "$stubs"/libm.a \
+    --as-needed "$sdk"/target/lib/*.so
+# The system module stub libraries go last: a .so listed before the objects that
+# import it satisfies nothing yet, and --as-needed then drops it — which is what
+# left every sceVideoOut/scePad/sceAudioOut import undefined when they sat first.
+# They stay --as-needed so only the modules actually imported end up as NEEDED:
+# listing all 32 makes the loader demand libmonosgen/libSceHttp on a title that
+# never calls them.
 
 printf 'PORT_ELF: %s\n' "$work/llvm-pie.elf"

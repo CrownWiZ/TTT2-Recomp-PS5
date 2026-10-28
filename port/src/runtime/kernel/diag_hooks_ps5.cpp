@@ -119,6 +119,34 @@ void GameHeapOps(uint64_t& thread, uint64_t& all)
 PPCContext* WatchGuestContextOf(uint32_t tid) { return hitch::GuestContextOf(tid); }
 PPCContext* WatchGuestContextOf(unsigned long tid) { return hitch::GuestContextOf(uint32_t(tid)); }
 
+// skin_profile.cpp's skinning diagnostic (diag_hooks.cpp's opt-in job tracker):
+// the console build carries no diag table, so the hooks are no-ops.
+void DiagSkinJob(PPCContext& ctx, uint8_t* base, uint32_t kernel, uint32_t stride)
+{
+    (void)ctx; (void)base; (void)kernel; (void)stride;
+}
+
+bool DiagSkinDescribe(uint32_t addr, char* out, size_t size)
+{
+    (void)addr; (void)out; (void)size;
+    return false;
+}
+
+// host_runtime_posix_diagnostics.h's DumpAllStacks is a header-inline that walks
+// /proc; the console has no such thing, so the dump is a single line and the
+// native sampler has nothing to add.
+void DumpAllStacks(const char* why)
+{
+    std::fprintf(stderr, "[stacks] %s\n", why ? why : "thread dump");
+    hitch::DumpGuestThreads();
+}
+
+// kernel_video.cpp's mode-3 hitch hooks: hitch::Mode() is 0 on the console (the
+// signal sampler needs a kernel the closed SDK does not expose), so both are
+// inert — but they must exist for the command-processor call sites to link.
+void HitchRegisterThread(const char* name) { (void)name; }
+void HitchFrameGap(double ms) { (void)ms; }
+
 // The posix diagnostics header contract: the scheduled dumps stay null hooks
 // on the console (the fault boundary owns recovery by itself).
 namespace hitch {

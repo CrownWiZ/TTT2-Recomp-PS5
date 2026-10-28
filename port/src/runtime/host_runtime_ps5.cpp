@@ -89,11 +89,13 @@ void InstallGuestGuards()
     // platform (spec 93-95) and the recomp validates without it.
 }
 
-void LogDrain(unsigned) {}
-
 void host_runtime::StartShaderPrebuild() {}
 
 } // namespace host_runtime
+
+// kernel_shared.h's contract is the global one, as on Linux: stderr is
+// unbuffered on the console, so there is nothing to drain.
+void LogDrain(unsigned) {}
 
 // In-process notification toast announcing the boot, mirroring the M3 cycle.
 extern "C" void Ps5Notify(const char* message)

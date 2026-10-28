@@ -93,3 +93,31 @@ M3 cerrado antes de esto (f8f5656): ciclo validado en consola (3/3 burbujas, elf
 5. Relax de gates (#error) en host_random_linux / host_storage_linux con TTT2_HOST_PS5.
 6. Trampolines Vulkan (vkGetInstanceProcAddr→vk_icdGetInstanceProcAddr + vkGetDeviceProcAddr vía GIPA; patrón entrypoints.c).
 7. `tools/ps5/build_port_ps5.sh` — lista explicit del target Linux (CMakeLists 269-282 + kernel glob excl. windows-y + gpu_render/native_d3dcompiler + PPC con splitter) + radv-link recipe + elfldr 9021.
+
+## TASK 5 CERRADO (28-10 18:26) — EL PORT ENLAZA
+
+`PORT_ELF: /root/m4/port-ps5/llvm-pie.elf` — 216 MB, ELF64 DYN, `_start` en `0x5174140`,
+**cero undefineds**. `scanelf`/`nm` confirman `D3D11CreateDevice`, `D3D11CreateDeviceAndSwapChain`,
+`CreateDXGIFactory1`, `D3DCompile` definidos dentro del ELF, y los imports `sceVideoOut*`,
+`scePad*`, `sceAudioOut*`, `sceUserService*` como `U` (los ata el loader vía la tabla del módulo).
+
+**NEEDED final (solo lo que se usa):** libSceAgc.prx, libSceAgcDriver.prx, libSceAudioOut,
+libSceLibcInternal, libScePad, libScePosixForWebKit, libSceUserService, libSceVideoOut,
+libkernel, libkernel_sys. Nada de libmonosgen/libSceHttp: `--as-needed` al final del link.
+
+**Los 9 bugs que bloqueaban el enlace (todos reales, ninguno de entorno):**
+1. `DXVK_WSI_DISPLAY=1` faltaba en el cross-compile del port → `native_wsi.h` acababa en `#error Unknown wsi!` (el include ya resolvía; el fallo era el macro).
+2. `gpu_hw_d3d11.h` usaba Win32 directo en 6 sitios → ramas `TTT2_HOST_PS5`: `HostClientRect` pregunta el tamaño al video shell (`host_window::DisplaySize`, nuevo en el contrato `host_window.h`), `HostWindowFocused`=true, `HostYield`=yield, `HostBackgroundPriority`/`HostThreadTag`/`DisplayHz`(60)/`ShaderCacheDirectory`/`PendingCopyWaiter`/`HostWaitFence` por el camino posix.
+3. **`rdr_$(basename "$src")` sin `.o`** en el build script: el objeto del renderer se llamaba `rdr_gpu_render.cpp` y el glob `obj/*.o` no lo veía — de ahí la avalancha de `GpuHwPresent`/`GpuExecuteDraw`/`GpuHwResolve` "undefined" con el código ya compilado al lado.
+4. OpenSSL: el `async.o` del archivo se compiló ANTES de que `configuration.h` tuviera `OPENSSL_NO_ASYNC` (`make` no lo recompiló; mtime del .o 14:56 > configuration.h 14:54). `rebuild_openssl_no_async.sh` ahora borra los .o de `crypto/async` antes del `make`. Queda `async_local_cleanup` → shim no-op en `stub_netmmsg.sh` (con no-async no hay fibre que limpiar).
+5. `--as-needed "$sdk"/target/lib/*.so` estaba AL PRINCIPIO del link: lld las tiraba antes de ver los objetos. Van al final. (Con `--no-as-needed` enlazaba pero metía las 32 .so como NEEDED.)
+6. **`sce_ps5.h` sin `extern "C"`** → los imports salían manglados (`_Z10scePadInitv`) y los stubs .so exportan el nombre C. Éste era el "no resuelven los módulos" que parecía un problema del SDK. Ojo: los objetos que incluyen la cabecera hay que tocarlos (`grep -rl sce_ps5.h | xargs touch`) porque el skip del script es por mtime del .cpp, no de headers.
+7. `sceVideoOutSubmitFlip2` NO existe en la tabla del stub (solo `sceVideoOutSubmitFlip`) → cambiado en shell y cabecera.
+8. `dxvk::Logger::s_instance` duplicado entre `d3d11_static.a` y `dxgi_static.a` → `--allow-multiple-definition` (dos copias del mismo puntero de log; quien gane sirve a ambos).
+9. `diag_hooks_linux.cpp` se colaba en el glob del kernel (incluye `linux/futex.h`) → excluido; `diag_hooks_ps5.cpp` gana `DiagSkinJob`/`DiagSkinDescribe`/`DumpAllStacks`/`HitchRegisterThread`/`HitchFrameGap`. Y `LogDrain` estaba dentro de `namespace host_runtime` cuando `kernel_shared.h` lo pide global → movido fuera (espejo de host_runtime_linux.cpp).
+
+**Sin CRT no hay arranque:** el link no tenía `_start` (entry 0x0, sin warning porque el `-e` no encuentra el símbolo y el script no lo exige). Nuevo `port/src/runtime/ps5_entry.cpp`: `ps5_fp_ieee()` (la consola arranca la FP en FTZ/DAZ y el recomp + DXVK asumen IEEE), `_init_env`, atexit del loader, arrays `.preinit/.init`, `main`, `exit`. Mismo contrato que `tooling/native/app_crt.cpp` del stack de referencia.
+
+**Ficheros nuevos de tooling:** `check_port_elf.sh` (NEEDED + entry + definiciones clave), `check_sdk_libs.sh`, `probe_sce_link.sh` (sonda mínima del binding de stubs), `check_openssl_syms.sh`, `rebuild_openssl_no_async.sh`, `stub_netmmsg.sh`.
+
+**Próximo = Task 6 (necesita al usuario):** encender la PS5, subir el ELF + `tekken.img` + game files por FTP :2121 al ftpsrv residente de M3, lanzar por elfldr :9021 y capturar el primer frame. **Avisar SIEMPRE antes de cada lanzamiento o captura.**
