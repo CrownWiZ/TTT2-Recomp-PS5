@@ -30,6 +30,7 @@
 #endif
 #include "gpu_hw_texture_upload.h"
 #include "gpu_hw_writeback.h"
+#include "splash.h"
 #include "gpu_hw_control.h"
 #include "gpu_hw_dirty_tracker.h"
 #include "gpu_adapter.h"
@@ -1131,11 +1132,84 @@ public:
     // displaySwapRB: the front buffer's fetch-constant swizzle exchanges red and blue (TTT2's
     // .zyx1). The image shown is swizzle(stored bytes); a GPU-resolved front buffer holds the
     // unswapped render, so swap only when exactly one of the two exchanges applies.
+    // The swap chain the CP thread presents through (created once, on demand).
+    bool EnsureSwapchain(HWND w)
+    {
+        if (swapchain_) return true;
+        ComPtr<IDXGIDevice> dxgi; ComPtr<IDXGIAdapter> adapter; ComPtr<IDXGIFactory2> factory;
+        Check(device_.As(&dxgi), "QueryDxgiDevice");
+        Check(dxgi->GetAdapter(&adapter), "GetAdapter");
+        Check(adapter->GetParent(IID_PPV_ARGS(&factory)), "GetFactory2");
+        RECT rc{};
+        HostClientRect(w, &rc);
+        DXGI_SWAP_CHAIN_DESC1 d{};
+        d.Width = std::max<LONG>(1, rc.right - rc.left); d.Height = std::max<LONG>(1, rc.bottom - rc.top);
+        d.Format = DXGI_FORMAT_B8G8R8A8_UNORM; d.SampleDesc.Count = 1;
+        // TTT2_SWAP_BUFFERS=3/4 (experiment): MEASURED 2026-10-15 over 5 min of real play,
+        // three buffers neither shortened the fight intro's readback waits (median 7.6 ms
+        // either way) nor reduced dropped frames, so two stay the default.
+        static const UINT buffers = [] { const char* e = std::getenv("TTT2_SWAP_BUFFERS"); const int n = e ? std::atoi(e) : 2; return UINT(std::clamp(n, 2, 4)); }();
+        d.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT; d.BufferCount = buffers;
+        d.Scaling = DXGI_SCALING_STRETCH; d.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        d.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+        // VSYNC OFF presents with tearing allowed, which needs the swap chain flag: set whenever
+        // the system supports it (ResizeBuffers keeps it, SwapChainFlags). TTT2_NO_TEARING=1
+        // leaves it out (VSYNC OFF then only changes exclusive fullscreen).
+        ComPtr<IDXGIFactory5> factory5;
+        BOOL tearing = FALSE;
+        static const bool noTearing = [] { const char* e = std::getenv("TTT2_NO_TEARING"); return e && *e == '1'; }();
+        tearing_ = !noTearing && SUCCEEDED(factory.As(&factory5)) &&
+                   SUCCEEDED(factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &tearing, sizeof(tearing))) && tearing;
+        d.Flags = SwapChainFlags();
+        Check(factory->CreateSwapChainForHwnd(device_.Get(), w, &d, nullptr, nullptr, &swapchain_), "CreateSwapChainForHwnd");
+        factory->MakeWindowAssociation(w, DXGI_MWA_NO_ALT_ENTER);       // the window thread owns Alt+Enter
+        bufW_ = d.Width; bufH_ = d.Height;
+        refreshHz_ = DisplayHz(w);
+        std::fprintf(stderr, "[gpu-hw] presenting through a DXGI flip swap chain (%ux%u), tearing %s, display %u Hz, %s\n",
+                     bufW_, bufH_, tearing_ ? "supported" : "not supported", refreshHz_, OutputInfo().c_str());
+        return true;
+    }
+
+    // The boot splash image, uploaded once (splash::Pixels() is BGRX like the back buffer).
+    void EnsureSplashTexture()
+    {
+        if (splashTex_) return;
+        D3D11_TEXTURE2D_DESC d{};
+        d.Width = 1280; d.Height = 720; d.MipLevels = 1; d.ArraySize = 1;
+        d.Format = DXGI_FORMAT_B8G8R8A8_UNORM; d.SampleDesc.Count = 1;
+        d.Usage = D3D11_USAGE_IMMUTABLE; d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        D3D11_SUBRESOURCE_DATA init{ splash::Pixels(), 1280 * 4, 0 };
+        Check(device_->CreateTexture2D(&d, &init, &splashTex_), "CreateSplashTexture");
+    }
+
     bool Present(uint32_t frontBuffer, bool displaySwapRB, const uint32_t* gammaRamp, uint32_t gammaVersion)
     {
         using clock = std::chrono::steady_clock;
         const auto t0 = clock::now();
         Initialize();
+        // Boot splash (splash.h): the attribution screen shows through the same
+        // swap chain before the game's frontbuffer reaches the display. The
+        // game keeps booting underneath; when the window ends, its frames flow.
+        if (splash::Active())
+        {
+            static int logged = [] { std::fprintf(stderr, "[splash] on (presenting attribution)\n"); std::fflush(stderr); return 0; }();
+            (void)logged;
+            HWND wS = window_.load();
+            if (wS && EnsureSwapchain(wS))
+            {
+                EnsureSplashTexture();
+                UpdateScale();
+                ApplyDisplay(wS);
+                ComPtr<ID3D11Texture2D> back;
+                Check(swapchain_->GetBuffer(0, IID_PPV_ARGS(&back)), "GetBackBuffer");
+                PresentScaled(splashTex_.Get(), back.Get(), false, false);
+                const auto [intervalS, flagsS] = PresentMode(false);
+                const HRESULT hrS = swapchain_->Present(intervalS, flagsS);
+                targetBindingValid_ = false;
+                (void)hrS;
+                return true;
+            }
+        }
         UpdateScale();
         FollowMipToggle();
         FinishSmallWritebacks();
@@ -1166,40 +1240,7 @@ public:
             surfaceGeneration_ = generation;
         }
 #endif
-        if (!swapchain_)
-        {
-            ComPtr<IDXGIDevice> dxgi; ComPtr<IDXGIAdapter> adapter; ComPtr<IDXGIFactory2> factory;
-            Check(device_.As(&dxgi), "QueryDxgiDevice");
-            Check(dxgi->GetAdapter(&adapter), "GetAdapter");
-            Check(adapter->GetParent(IID_PPV_ARGS(&factory)), "GetFactory2");
-            RECT rc{};
-            HostClientRect(w, &rc);
-            DXGI_SWAP_CHAIN_DESC1 d{};
-            d.Width = std::max<LONG>(1, rc.right - rc.left); d.Height = std::max<LONG>(1, rc.bottom - rc.top);
-            d.Format = DXGI_FORMAT_B8G8R8A8_UNORM; d.SampleDesc.Count = 1;
-            // TTT2_SWAP_BUFFERS=3/4 (experiment): MEASURED 2026-10-15 over 5 min of real play,
-            // three buffers neither shortened the fight intro's readback waits (median 7.6 ms
-            // either way) nor reduced dropped frames, so two stay the default.
-            static const UINT buffers = [] { const char* e = std::getenv("TTT2_SWAP_BUFFERS"); const int n = e ? std::atoi(e) : 2; return UINT(std::clamp(n, 2, 4)); }();
-            d.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT; d.BufferCount = buffers;
-            d.Scaling = DXGI_SCALING_STRETCH; d.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-            d.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
-            // VSYNC OFF presents with tearing allowed, which needs the swap chain flag: set whenever
-            // the system supports it (ResizeBuffers keeps it, SwapChainFlags). TTT2_NO_TEARING=1
-            // leaves it out (VSYNC OFF then only changes exclusive fullscreen).
-            ComPtr<IDXGIFactory5> factory5;
-            BOOL tearing = FALSE;
-            static const bool noTearing = [] { const char* e = std::getenv("TTT2_NO_TEARING"); return e && *e == '1'; }();
-            tearing_ = !noTearing && SUCCEEDED(factory.As(&factory5)) &&
-                       SUCCEEDED(factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &tearing, sizeof(tearing))) && tearing;
-            d.Flags = SwapChainFlags();
-            Check(factory->CreateSwapChainForHwnd(device_.Get(), w, &d, nullptr, nullptr, &swapchain_), "CreateSwapChainForHwnd");
-            factory->MakeWindowAssociation(w, DXGI_MWA_NO_ALT_ENTER);       // the window thread owns Alt+Enter
-            bufW_ = d.Width; bufH_ = d.Height;
-            refreshHz_ = DisplayHz(w);
-            std::fprintf(stderr, "[gpu-hw] presenting through a DXGI flip swap chain (%ux%u), tearing %s, display %u Hz, %s\n",
-                         bufW_, bufH_, tearing_ ? "supported" : "not supported", refreshHz_, OutputInfo().c_str());
-        }
+        if (!swapchain_ && !EnsureSwapchain(w)) return false;
         const auto t1 = clock::now();
         ApplyDisplay(w);
         ComPtr<ID3D11Texture2D> back;
@@ -1878,7 +1919,7 @@ private:
         ID3D11ShaderResourceView* none[2] = { nullptr, nullptr };
         context_->PSSetShaderResources(0, 2, none);
     }
-    void PresentScaled(ID3D11Texture2D* source, ID3D11Texture2D* back, bool swap)
+    void PresentScaled(ID3D11Texture2D* source, ID3D11Texture2D* back, bool swap, bool gamma = true)
     {
         PresentShaders();
         if (backRtvFor_ != back)
@@ -1907,7 +1948,7 @@ private:
         BindVertexShader(presentVs_.Get());
         ID3D11SamplerState* s = presentSampler_.Get();
         context_->PSSetSamplers(0, 1, &s);
-        ID3D11PixelShader* display = displayPs_[(swap ? 1 : 0) | (gammaApplied_ ? 2 : 0)].Get();
+        ID3D11PixelShader* display = displayPs_[(swap ? 1 : 0) | ((gamma && gammaApplied_) ? 2 : 0)].Get();
         const UINT sw = sd.Width, sh = sd.Height;
         const int sharpness = display_settings::GetSharpness(), aa = display_settings::GetAntiAliasing();
         const bool resample = sw != vw || sh != vh;
@@ -2529,6 +2570,7 @@ private:
     uint32_t overrideMask_ = 0;       // texture slots forced to white (diagnostics)
     uint32_t overridePsDwords_ = 0;   // ...only in pixel shaders of this size (0 = cube shaders)
     ComPtr<IDXGISwapChain1> swapchain_;
+ComPtr<ID3D11Texture2D> splashTex_;
 #ifdef __ANDROID__
     uint64_t surfaceGeneration_ = 0;
 #endif

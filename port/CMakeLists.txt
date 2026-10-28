@@ -577,3 +577,5 @@ if(TTT2_CRT_DIRS AND TTT2_EDITBIN AND EXISTS "${TTT2_STEAM_DLL}" AND EXISTS "${X
 else()
     message(STATUS "installer: unavailable (needs the x64 VC++ redist, editbin, the Steamworks SDK and XenonUtils)")
 endif()
+
+# m4: boot splash (re-glob trigger)

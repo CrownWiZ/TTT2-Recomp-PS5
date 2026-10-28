@@ -28,6 +28,7 @@
 #include "../host_thread.h"
 #include "../host_deadline_wait.h"
 #include "host_settings.h"
+#include "splash.h"
 #ifdef _WIN32
 #include "../host_window_win32.h"
 #endif
@@ -277,6 +278,13 @@ static unsigned PresentThread(void*)
     for (;;)
     {
         PumpWindow(window);
+        if (splash::Active())
+        {
+            // Boot splash: attribution before the publisher logo reaches the screen.
+            host_window::Blit(window, splash::Pixels(), FB_W, FB_H);
+            host_window::Idle(16);
+            continue;
+        }
         if (uint32_t fb = g_frontBufferPhys.load())
         {
             ConvertFrontBuffer(fb, staging);

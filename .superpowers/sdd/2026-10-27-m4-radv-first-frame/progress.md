@@ -38,17 +38,14 @@ M3 cerrado antes de esto (f8f5656): ciclo validado en consola (3/3 burbujas, elf
 - **Task 4 (DXVK WSI): PENDIENTE** — con el GO, el siguiente corte: DXVK-native como objetos estáticos para PS5 (WSI sobre VK_KHR_display).
 - **Task 5 (port host -ps5 + build): PENDIENTE**.
 
-## PAUSA (27-10 noche) — dónde retomar (28-10)
+## SPLASH CERRADO (28-10 mediodía)
 
-**Estado del splash (MediaPlayerPlaneTask = la pantalla de créditos):**
-- Implementado y compilando en `port/build-o2` (splash.cpp/h + hooks en kernel_video.cpp y gpu_hw_d3d11.h — ambos caminos de present).
-- **BUG PENDIENTE**: el texto sale mal dibujado. Catálogo de la saga: (a) burst_6.png = texto "shifted +1 en ASCII" (parece "UFLLFO" en vez de "TEKKEN"); (b) burst_8.png (tras restaurar MSB-first `0x80>>col` + un reverse de orden de chars a ciegas en Text()) = texto ainda girado/invertido. La última edición en `splash.cpp::Text()` (orden invertido) probablemente INCORRECTA → **primer paso al volver: revertir Text() al orden natural (++s) y diagnosticar el índice del glyph con una línea "TEST" + burst-capture (el tool funciona: `.superpowers/splash_burst2.ps1` / burst_*.png).**
-- La hipótesis NO confirmada: el bitmap-font table (kFont) o el orden de bits por fila; el PIL-test del "S" salió legible con MSB-first.
-- Aviso al usuario ANTES de cada lanzamiento/captura automática (lo pidió explícito).
+- **Resuelto.** Eran tres capas apiladas: (1) `Glyph()` decodificaba MSB-first y la tabla es **LSB-first** (bit 0 = píxel izquierdo, filas top-down) → cada glifo espejado; (2) a `kFont` le faltaba **la fila `<` (0x3C)** → todo ≥ '<' indexaba +1 (dígitos/espacio/`:` intactos — "QT5" conservaba el 5; las minúsculas "parecían flippeadas" porque +1 las mapea a sus gemelas p↔q — reporte del usuario confirmado como síntoma, no como bug aparte); (3) `Text()` tenía el reverse a ciegas → orden invertido. Fix: `(1u << col)`, fila `<` insertada (label `=` corregida), `Text()` orden natural. **Verificado con burst**: título/subtítulo/créditos legibles (burst_6). Línea TEST eliminada; build final enlazado.
+- Nota de método: veredicto cerrado con ground-truth offline ANTES de tocar el C++ (`splash_fonttest.py` → `fonttest_td_lsb.png` = "TEST 2JRS" legible entre las 4 combinaciones). El PIL-test del "S" de anoche era trampa: S espejado se sigue leyendo S.
+- Working tree: commit limpio del splash (splash.cpp/h + hooks kernel_video/gpu_hw_d3d11 + CMakeLists). `tools/ps5/vkinfo/main.c` + `entrypoints.c` quedan SIN commitear (spike Task 3; puede estar a medio editar — decidir al retomar Task 4).
 
-**Estado del M4 (resto):**
-- RADV-PS5 ps5.a (272.8 MB, pin 1ba9874f) + libc.prx (hash exacto) + native-tool ✓ en WSL `~/m4/`.
-- El enlace BigApp del spike: llvm-pie.elf enlazado; el native-tool exige imports-limpios (pendiente de la capacidad "application exports") → el runtime real de títulos = pila ps5vk + runtime (M4/M5).
-- HOST-MODEL GO ✅ (vulkaninfo: "PlayStation 5 GPU (RADV NAVI21)", 1.4.354, Mesa 26.2) — la tabla DXVK veredicto GO en el ledger.
+## PAUSA (28-10 mediodía) — dónde retomar
 
-**Commits hoy:** f8f5656 (m3 close), ff8893f (F1-F3 audio), 0d68222 (m4 plan+deps), f66c1f6 (pins ruling), 09a19a4 (RADV GO). Working tree con la saga del splash = SIN commitear (corregir primero, luego commit limpio del splash + resto).
+- **Task 4 (DXVK WSI): siguiente corte** — DXVK-native como objetos estáticos para PS5 (WSI sobre VK_KHR_display); GO de features vigente (ledger Task 3).
+- Luego Task 5 (port host -ps5 + build), Task 6 (primer frame en la TV), Task 7 (cierre) según plan.
+- Recordatorio de protocolo: aviso al usuario ANTES de cada lanzamiento/captura automática.
