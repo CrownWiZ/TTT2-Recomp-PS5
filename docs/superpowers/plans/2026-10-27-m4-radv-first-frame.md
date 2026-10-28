@@ -46,10 +46,10 @@
 - [ ] Build del `libvulkan_radeon.ps5.a` (en curso, background).
 - [ ] Build + envío del spike; veredicto de features DXVK vs RADV-PS5.
 
-### Task 4: DXVK-native WSI PS5 (objetos estáticos)
+### Task 4: DXVK-native WSI PS5 (objetos estáticos) — HECHO
 
-- [ ] Parche WSI: backend `display` (VK_KHR_display + sceVideoOut) al estilo del parche sdl3 del upstream; meson cross del DXVK con el cross-file del SDK fork.
-- [ ] `libdxvk_d3d11.a`/`libdxvk_dxgi.a` estáticos para PS5.
+- [x] Parche WSI: backend `display` (VK_KHR_display) + espejos estáticos `dxgi_static`/`d3d11_static`, `lib_vulkan` opcional, backend exts con KHR_surface+KHR_display (parche `dxvk-native-1.9.2b-ps5-display-wsi.patch`, en el manifest tras shared-wsi).
+- [x] Estáticos para PS5 (WSL, SDK mihawk): libutil/libspirv/libwsi/libvkcommon/libdxvk/libdxbc/dxgi_static/d3d11_static — nm: D3D11CreateDevice(+AndSwapChain), CreateDXGIFactory/1/2 exportados; 2.108 símbolos T; objetos completos en disco (Task 5 enlaza desde el build dir WSL).
 
 ### Task 5: Host `-ps5` del port + build completo
 
